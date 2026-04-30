@@ -57,6 +57,46 @@ impl TypedOp for TypedConcat {
         Ok(tvec!(fact))
     }
 
+    fn input_roi(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TVec<Option<TDim>>>> {
+        let output_fact = model.outlet_fact(OutletId::new(node.id, 0))?;
+        rule_if_some!(roi = &output_fact.region_of_interest);
+        let input_facts: TVec<&TypedFact> =
+            node.inputs.iter().map(|i| model.outlet_fact(*i)).collect::<TractResult<_>>()?;
+        let inputs_ref: Vec<&TypedFact> = input_facts.iter().copied().collect();
+        let offsets = self.offsets(&inputs_ref)?;
+
+        // Find the coordinate symbol that designates the concat axis in the
+        // output ROI expression (if any). If absent, the ROI is invariant on
+        // the concat axis and passes through to every input unchanged.
+        let axis_sym = roi
+            .symbols()
+            .into_iter()
+            .find(|s| crate::ops::logic::sym_to_coord_axis(s) == Some(self.axis));
+
+        let input_rois: TVec<Option<TDim>> = (0..node.inputs.len())
+            .map(|ix| {
+                let shift = &offsets[ix];
+                match &axis_sym {
+                    None => Some(roi.clone()),
+                    Some(sym) if shift.is_zero() => Some(roi.clone()),
+                    Some(sym) => {
+                        // Remap output 🎯axis → input 🎯axis + offset[ix], so
+                        // that the i-th input receives the slice of the output
+                        // ROI that corresponds to its [offset[i], offset[i+1])
+                        // range, expressed in the input's local coordinates.
+                        let shifted = TDim::Sym(sym.clone()) + shift.clone();
+                        roi.substitute(sym, &shifted).ok().or_else(|| Some(roi.clone()))
+                    }
+                }
+            })
+            .collect();
+        Ok(Some(input_rois))
+    }
+
     fn axes_mapping(
         &self,
         inputs: &[&TypedFact],
@@ -154,5 +194,86 @@ impl EvalOp for TypedConcat {
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let result = Tensor::stack_tensors(self.axis, &inputs)?;
         Ok(tvec![result.into_tvalue()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When the output has no `region_of_interest`, `input_roi` returns `None`
+    /// (the pass moves on without recording demands for this node's inputs).
+    #[test]
+    fn input_roi_with_no_output_roi_returns_none() {
+        let mut model = TypedModel::default();
+        let fact = TypedFact::dt_shape(f32::datum_type(), [1.to_dim(), 4.to_dim()]);
+        let i0 = model.add_source("a", fact.clone()).unwrap();
+        let i1 = model.add_source("b", fact.clone()).unwrap();
+        let outlets = model.wire_node("concat", TypedConcat { axis: 1 }, &[i0, i1]).unwrap();
+
+        let node = &model.nodes()[outlets[0].node];
+        let op = node.op.downcast_ref::<TypedConcat>().unwrap();
+        assert!(op.input_roi(&model, node).unwrap().is_none());
+    }
+
+    /// When the output ROI mentions the concat axis, each input branch gets
+    /// the ROI translated by its branch offset (input 0 unchanged, input 1
+    /// shifted by +len_0, etc.) — mirrors `Slice::input_roi`'s shift but per
+    /// branch.
+    #[test]
+    fn input_roi_translates_concat_axis_per_branch_offset() {
+        let mut model = TypedModel::default();
+        let fact = TypedFact::dt_shape(f32::datum_type(), [1.to_dim(), 4.to_dim()]);
+        let i0 = model.add_source("a", fact.clone()).unwrap();
+        let i1 = model.add_source("b", fact.clone()).unwrap();
+        let i2 = model.add_source("c", fact.clone()).unwrap();
+        let outlets =
+            model.wire_node("concat", TypedConcat { axis: 1 }, &[i0, i1, i2]).unwrap();
+
+        // Manually annotate the output with a ROI mentioning the axis-1 coord
+        // symbol. The expression itself is opaque; only the substitution
+        // matters for this test.
+        let axis_sym = model.symbols.coord_sym(1);
+        let roi_expr = TDim::Sym(axis_sym.clone());
+        model.nodes_mut()[outlets[0].node].outputs[0].fact.region_of_interest =
+            Some(roi_expr.clone());
+
+        let node = &model.nodes()[outlets[0].node];
+        let op = node.op.downcast_ref::<TypedConcat>().unwrap();
+        let result = op.input_roi(&model, node).unwrap().expect("input_roi");
+
+        assert_eq!(result.len(), 3);
+        // Input 0 (offset 0): unchanged
+        assert_eq!(result[0], Some(roi_expr.clone()));
+        // Input 1 (offset 4): 🎯1 + 4
+        assert_eq!(result[1], Some(TDim::Sym(axis_sym.clone()) + 4.to_dim()));
+        // Input 2 (offset 8): 🎯1 + 8
+        assert_eq!(result[2], Some(TDim::Sym(axis_sym) + 8.to_dim()));
+    }
+
+    /// When the output ROI does not mention the concat axis (e.g., only
+    /// references a non-concat axis), every input branch gets the same ROI
+    /// passed through unchanged.
+    #[test]
+    fn input_roi_without_concat_axis_passes_through_unchanged() {
+        let mut model = TypedModel::default();
+        let fact = TypedFact::dt_shape(f32::datum_type(), [1.to_dim(), 4.to_dim()]);
+        let i0 = model.add_source("a", fact.clone()).unwrap();
+        let i1 = model.add_source("b", fact.clone()).unwrap();
+        let outlets = model.wire_node("concat", TypedConcat { axis: 1 }, &[i0, i1]).unwrap();
+
+        // ROI mentions axis 0, not the concat axis 1 — should pass through.
+        let other_axis_sym = model.symbols.coord_sym(0);
+        let roi_expr = TDim::Sym(other_axis_sym);
+        model.nodes_mut()[outlets[0].node].outputs[0].fact.region_of_interest =
+            Some(roi_expr.clone());
+
+        let node = &model.nodes()[outlets[0].node];
+        let op = node.op.downcast_ref::<TypedConcat>().unwrap();
+        let result = op.input_roi(&model, node).unwrap().expect("input_roi");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], Some(roi_expr.clone()));
+        assert_eq!(result[1], Some(roi_expr));
     }
 }
