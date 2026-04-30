@@ -59,13 +59,24 @@ impl DelayState {
             if buffered < input_pulse {
                 buffer.assign_slice_unchecked(.., input, (input_pulse - buffered).., op.axis);
             } else {
+                // The previous implementation used `rotate_left(stride)`, which preserves
+                // the oldest `input_pulse` rows by moving them to the end. Those rows are
+                // then immediately overwritten by the `assign_slice_unchecked` below, so
+                // the rotation does redundant work. We replace it with a `copy_within` that
+                // only shifts the rows we keep (the newest `buffered - input_pulse` rows)
+                // toward the front; the now-stale tail is overwritten by the assignment.
+                //
+                // Profiling on DFN3 (pulse-mode streaming) showed `rotate_left` accounting
+                // for ~7% of df_dec inference time. `copy_within` of `(N - stride)` bytes
+                // is roughly half the work of `rotate_left(stride)` on a buffer of N bytes
+                // (one `memmove` vs three reverses or a gcd-cycle rotation).
                 let stride =
                     buffer.strides()[op.axis] as usize * input.datum_type().size_of() * input_pulse;
-                std::slice::from_raw_parts_mut(
+                let bytes = std::slice::from_raw_parts_mut(
                     buffer.as_ptr_mut_unchecked::<u8>(),
                     buffer.len() * input.datum_type().size_of(),
-                )
-                .rotate_left(stride);
+                );
+                bytes.copy_within(stride.., 0);
                 buffer.assign_slice_unchecked((buffered - input_pulse).., input, .., op.axis);
             }
         }
