@@ -149,9 +149,36 @@ The native AMX kernel has high per-tile setup overhead (32-row tiles, AMX accumu
 - All existing einsum/matmul/quant tests
 - Integration suites: `tract-onnx`, `tract-onnx-opl`, `tract-hir`, `tract-nnef`, `tract-pulse` — all green
 
+## End-to-end WAV bit-exact through full DFN3 pipeline ✓
+
+To verify zero quality regression at the actual audio output (not just the ONNX tensor boundary), the K=1 fix was backported to tract 0.22.1 (DFN3's pinned version) and DeepFilterNet's `deep-filter` Rust binary was rebuilt against (a) clean 0.22.1 and (b) backported 0.22.1.
+
+**Test:** real 48 kHz 27.29-second mono WAV → full enhance() pipeline (STFT → enc → erb_dec → df_dec → iSTFT → optional post-filter) → output WAV.
+
+| Test | Baseline WAV MD5 | Patched WAV MD5 | `cmp` | sample-bit diff |
+|---|---|---|---|---|
+| `f32_composite.wav` | matches patched | matches baseline | 0 | 0 / N samples |
+| `f32_composite_48k.wav` | `d50c1588...` | `d50c1588...` | 0 | 0 / 1,309,932 samples |
+| `f32_composite_48k.wav --pf` | `36527d37...` | `36527d37...` | 0 | 0 / 1,309,932 samples |
+
+**Every output PCM sample is bit-for-bit identical** between baseline tract 0.22.1 and tract 0.22.1 + K=1 fix, across normal and post-filter modes, on a real noisy WAV.
+
+End-to-end wall time on 27.29 s audio (deep-filter binary, includes model load):
+
+| Run | Baseline | Patched |
+|---|---|---|
+| 1 | 3.58 s | 1.95 s |
+| 2 | 3.27 s | 1.96 s |
+| 3 | 3.11 s | 1.97 s |
+| **mean** | **3.32 s** | **1.96 s** |
+| **RTF** | **0.122** | **0.072** |
+| **Δ** | | **−41% wall-clock, 1.69× faster** |
+
+Wall time includes ~0.5 s of model load + binary startup overhead, so the in-loop inference speedup is larger than 41%.
+
 ## Caveats
 
-- DFN3 testing means **sum of 3 ONNX models** through tract CLI on random tensor inputs, not the full `enhance()` pipeline (STFT/feature extraction live outside tract). Bit-exact on each ONNX output tensor means tract-side compute is unchanged; downstream iSTFT/post-filtering is not exercised. A WAV-bit-exact end-to-end test would require backporting the K=1 fix to tract 0.22.1 (DFN's pinned version) and rebuilding `deep-filter` against it — see "Reproduction kit" section below for the followup plan.
+- ONNX-tensor-level testing in earlier sections used random `np.random.seed(42)` inputs through individual ONNX models. The WAV bit-exact test above replaces that with real audio through the entire pipeline.
 - DFN2 was not benched on WASM (bit-exact on the same input pattern, expected to mirror DFN3 WASM gains).
 - `modnet` initial 2-run sample showed +3.7%; multi-run analysis collapsed to +0.06% (Welch t=0.03 = indistinguishable). Demonstrates importance of multi-run + interleaved methodology.
 
@@ -159,6 +186,7 @@ The native AMX kernel has high per-tile setup overhead (32-row tiles, AMX accumu
 
 | Category | Models tested | Gain |
 |---|---|---|
+| **Full DFN3 enhance() pipeline (real WAV)** | deep-filter binary on 27 s audio | **−41% wall-clock, 1.69× faster, every output sample bit-identical** |
 | **Audio enhancement, depthwise ConvTranspose with 1×N kernel** | DFN3, DFN2, GTCRN | **8% – 53% on the targeted op family; bit-exact on every output** |
 | **Audio enhancement, depthwise ConvTranspose with N×N kernel** | (no models tested in that subclass) | — |
 | **Vocoders, full-rank ConvTranspose** | HiFiGAN v2, v3 | no-op (fix doesn't fire) |
