@@ -33,10 +33,11 @@ if [[ ! -d tract-baseline ]]; then
   (cd tract-baseline && git checkout "$BASE_REF")
 fi
 
-# Copy and apply patch
+# Copy and apply patch (default: main; for v0.22.1 set PATCH=k1-fix-on-tract-0.22.1.patch)
+PATCH="${PATCH:-k1-fix-on-tract-main.patch}"
 if [[ ! -d tract-patched ]]; then
   cp -R tract-baseline tract-patched
-  (cd tract-patched && git am "$KIT_DIR"/*.patch)
+  (cd tract-patched && git am "$KIT_DIR/$PATCH")
 fi
 
 # Build both

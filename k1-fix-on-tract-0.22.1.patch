@@ -1,0 +1,184 @@
+From 632cf1f4d35d7ca6d8f511f389b30dbe540867d9 Mon Sep 17 00:00:00 2001
+From: czoli1976 <ckristian.zoli@gmail.com>
+Date: Fri, 1 May 2026 18:21:23 +0100
+Subject: [PATCH] core/einsum: lower K=1 contractions as broadcast Mul
+ (backport from sonos/tract#2183)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backports the K=1 → broadcast Mul short-circuit from sonos/tract#2183
+onto v0.22.1. Code path is identical to main; v0.22.1's einsum_matmul
+detect_rule has the same structure.
+
+Verified end-to-end on DeepFilterNet 3 enhance() pipeline (which pins
+tract 0.22.1): real WAV input through STFT → enc → erb_dec → df_dec →
+iSTFT [→ post-filter] → output WAV is bit-for-bit identical between
+clean 0.22.1 and 0.22.1 + this patch (md5 match, 0/1,309,932 PCM
+samples differ). End-to-end wall-clock −41% (3.32s → 1.96s mean of 3
+on a 27.29s 48 kHz noisy WAV).
+---
+ core/src/ops/einsum/einsum_matmul.rs | 133 ++++++++++++++++++++++++++-
+ 1 file changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/ops/einsum/einsum_matmul.rs b/core/src/ops/einsum/einsum_matmul.rs
+index 540358bec..63936cf29 100644
+--- a/core/src/ops/einsum/einsum_matmul.rs
++++ b/core/src/ops/einsum/einsum_matmul.rs
+@@ -7,7 +7,7 @@ use tract_linalg::pack::PackedFormat;
+ 
+ use super::*;
+ use crate::ops::cast::cast;
+-use crate::ops::math::add;
++use crate::ops::math::{add, mul};
+ use crate::ops::matmul::optimized::{
+     AddMatMulGeometry, MapOutputAxisToInput, OptMatMul, ProtoFusedSpec,
+ };
+@@ -217,6 +217,19 @@ pub(crate) fn detect_rule(
+     } else {
+         non_trivial_k_axis.first().or_else(|| k_axes.first()).copied()
+     };
++
++    // K=1 short-circuit: when the K product is statically 1 (or no K axis exists), the einsum
++    // collapses to a broadcast multiplication. Lowering it as a matmul leaves the GEMM kernel
++    // doing per-tile setup (clear, panel-load, store) for a single FMA, so a direct broadcast
++    // Mul is much faster.
++    if non_trivial_k_axis.is_empty() && op.q_params.is_none() {
++        if let Some(patch) =
++            try_rewrite_unit_k_as_broadcast_mul(op, model, node, &k_axes, &input_shapes)?
++        {
++            return Ok(Some(patch));
++        }
++    }
++
+     let Some(k_axis) = k_axis else { return inject_k_axis(op, model, node).map(Some) };
+ 
+     let mut possible_m_axes: Vec<_> = op
+@@ -283,6 +296,124 @@ pub(crate) fn detect_rule(
+     .map(Some)
+ }
+ 
++/// Rewrite an EinSum with effective K=1 (or no K axis) as a broadcast Mul.
++///
++/// Preconditions checked here:
++/// - All "k-like" axes (present in both inputs, absent from output) listed in `k_axes`
++///   have shape 1 in both inputs (or `k_axes` is empty).
++/// - There is no "non-trivial single-side disappearing" axis (an axis with non-trivial size
++///   in exactly one input but absent from output) — such axes would require a real reduction
++///   that broadcast Mul cannot express.
++/// - The op is not quantized (q_params is None) — caller must enforce.
++fn try_rewrite_unit_k_as_broadcast_mul(
++    op: &EinSum,
++    model: &TypedModel,
++    node: &TypedNode,
++    k_axes: &[&Axis],
++    input_shapes: &[Cow<[TDim]>],
++) -> TractResult<Option<TypedModelPatch>> {
++    let one = TDim::one();
++    // Reject "non-trivial single-side disappearing" axes — those need a real reduction.
++    for axis in op.axes.iter_all_axes() {
++        let in_left =
++            axis.inputs[0].first().map(|pos| &input_shapes[0][*pos]).unwrap_or(&one) != &one;
++        let in_right =
++            axis.inputs[1].first().map(|pos| &input_shapes[1][*pos]).unwrap_or(&one) != &one;
++        let in_out = !axis.outputs[0].is_empty();
++        if (in_left ^ in_right) && !in_out {
++            return Ok(None);
++        }
++    }
++
++    let c_axes: Vec<char> = op.axes.axes(InOut::Out(0)).map(|a| a.repr).collect();
++    if c_axes.is_empty() {
++        return Ok(None);
++    }
++
++    let k_reprs: TVec<char> = k_axes.iter().map(|a| a.repr).collect();
++    let mut patch = TypedModelPatch::new("EinSum K=1 to broadcast Mul");
++    let mut wires: TVec<OutletId> = patch.taps(model, &node.inputs)?;
++    let name = &node.name;
++
++    for (slot, wire) in wires.iter_mut().enumerate() {
++        // Promote inputs to operating_dt so the result type matches EinSum::output_facts.
++        let cur_dt = patch.outlet_fact(*wire)?.datum_type;
++        if cur_dt != op.operating_dt {
++            *wire = patch.wire_node(
++                format!("{name}.cast_in{slot}"),
++                cast(op.operating_dt),
++                &[*wire],
++            )?[0];
++        }
++
++        // Drop k axes (sorted descending so positions stay valid).
++        let mut k_positions: Vec<usize> =
++            k_axes.iter().map(|a| a.inputs[slot][0]).collect();
++        k_positions.sort_by(|a, b| b.cmp(a));
++        for (i, pos) in k_positions.into_iter().enumerate() {
++            *wire = patch.wire_node(
++                format!("{name}.rm_k_in{slot}.{i}"),
++                AxisOp::Rm(pos),
++                &[*wire],
++            )?[0];
++        }
++
++        let mut current: Vec<char> = op
++            .axes
++            .axes(InOut::In(slot))
++            .map(|a| a.repr)
++            .filter(|c| !k_reprs.contains(c))
++            .collect();
++
++        // Drop any remaining axes not in output (must be size 1 by precondition).
++        let mut to_drop: Vec<(usize, char)> = current
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c_axes.contains(c))
++            .map(|(i, c)| (i, *c))
++            .collect();
++        to_drop.sort_by(|a, b| b.0.cmp(&a.0));
++        for (pos, c) in to_drop {
++            *wire = patch.wire_node(
++                format!("{name}.rm_extra_in{slot}_{c}"),
++                AxisOp::Rm(pos),
++                &[*wire],
++            )?[0];
++            current.remove(pos);
++        }
++
++        // Insert unit axes for output axes missing from this input.
++        for (target_pos, &t) in c_axes.iter().enumerate() {
++            if !current.contains(&t) {
++                *wire = patch.wire_node(
++                    format!("{name}.add_in{slot}_{t}"),
++                    AxisOp::Add(target_pos),
++                    &[*wire],
++                )?[0];
++                current.insert(target_pos, t);
++            }
++        }
++
++        // Permute to match output axis order.
++        for (target_pos, &t) in c_axes.iter().enumerate() {
++            let cur_pos = current.iter().position(|&c| c == t).unwrap();
++            if cur_pos != target_pos {
++                *wire = patch.wire_node(
++                    format!("{name}.move_in{slot}_{t}"),
++                    AxisOp::Move(cur_pos, target_pos),
++                    &[*wire],
++                )?[0];
++                let removed = current.remove(cur_pos);
++                current.insert(target_pos, removed);
++            }
++        }
++    }
++
++    let result = patch.wire_node(name, mul(), &wires)?;
++    patch.shunt_outside(model, node.id.into(), result[0])?;
++    Ok(Some(patch))
++}
++
+ pub(super) fn inject_k_axis(
+     op: &EinSum,
+     model: &TypedModel,
+-- 
+2.50.1 (Apple Git-155)
+

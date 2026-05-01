@@ -14,7 +14,8 @@ Trigger: depthwise ConvTranspose with kernel having a 1-dim — common in audio 
 
 | File | Purpose |
 |---|---|
-| `0001-core-einsum-lower-K-1-contractions-as-broadcast-Mul.patch` | The single commit; apply with `git am` against tract main @ b36f34e92 (or rebase) |
+| `k1-fix-on-tract-main.patch` | The single commit, against `sonos/tract` main (currently `41b7b027c`). Apply with `git am`. This is what PR #2183 ships. |
+| `k1-fix-on-tract-0.22.1.patch` | Same change backported onto the `v0.22.1` tag — for downstream users still on 0.22.1 (e.g. DeepFilterNet, which pins `tract-core = "=0.22.1"`). Apply with `git am` from the `v0.22.1` commit (`53e97caf9`). |
 | `scripts/00_apply_patch.sh` | Set up baseline + patched checkouts, build both CLI binaries |
 | `scripts/01_test_unit.sh` | Run einsum + matmul + quant unit tests on the patched build |
 | `scripts/02_test_correctness_gtcrn.sh` | Bit-exact verification on GTCRN (small public ONNX, 344 KB) |
@@ -24,7 +25,8 @@ Trigger: depthwise ConvTranspose with kernel having a 1-dim — common in audio 
 | `scripts/lib_compare.py` | Helper: bit-exact tensor comparison via numpy |
 | `scripts/lib_stats.py` | Helper: Welch's t-test on bench samples |
 | `models/get_gtcrn.sh` | Download GTCRN ONNX from its public GitHub repo |
-| `RESULTS-OBSERVED.md` | The observed results from my own runs on Apple M-series + WASM (wasmtime 44) |
+| `RESULTS-OBSERVED.md` | Aggregated tables from my runs on Apple M-series (Native AMX) + WASM (wasmtime 44) |
+| `RAW-BENCH-LOGS.md` | Literal `Bench ran N times, X.XXX ms/i` lines per model — every individual run |
 
 ## Quick path (≈5 min compute, no external models needed)
 
