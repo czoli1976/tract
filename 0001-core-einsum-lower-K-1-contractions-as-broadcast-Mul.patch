@@ -1,0 +1,254 @@
+From 2641acbe352aaffc208ce02f78ac97136ca631e6 Mon Sep 17 00:00:00 2001
+From: czoli1976 <64466170+czoli1976@users.noreply.github.com>
+Date: Fri, 1 May 2026 14:46:57 +0100
+Subject: [PATCH] core/einsum: lower K=1 contractions as broadcast Mul
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When an EinSum's contraction product is statically 1 (every k-like axis
+has shape 1 in both inputs, or no k-like axis exists), detect_rule used
+to push it through the OptMatMul pipeline anyway. The GEMM kernel then
+ran one FMA per output tile against fixed per-tile setup (clear,
+panel-load, store), so the kernel preamble dominated runtime even though
+no real matmul work was happening.
+
+This case is reachable in practice. DeepFilterNet 3's erb_dec.onnx ends
+in two depthwise ConvTransposes whose 1xN kernel collapses to a per-
+channel scalar broadcast: each lowers to gmk,Ngnk->Ngmn with k=1. On
+M-series macOS the resulting OptMatMuls were ~7.4 ms and ~3.9 ms — a
+combined 50%+ of the decoder, despite doing one multiply per element.
+
+The fix adds a short-circuit before the EinSumMatMul construction: if
+all k-like axes are size 1 in both inputs, drop them, align the
+remaining axes to the output order with AxisOp::Add/Move/Rm, and wire a
+broadcast Mul instead. Inputs are cast up to operating_dt first so the
+output type still matches what EinSum::output_facts promises (relevant
+for the dequantized i8 -> i32 path that runs through detect_rule again).
+
+Quantized EinSums (q_params=Some) are left to the existing dequant path
+in EinSumMatMul::codegen, which produces a non-q EinSum that this rule
+then catches naturally.
+
+erb_dec.onnx end-to-end on M-series macOS: 20.3 ms -> 9.7 ms (-52%).
+The two ConvTranspose einsums go from 7.4 ms / 3.9 ms to 0.22 ms /
+0.11 ms. Output is bit-exact against the unmodified pipeline.
+---
+ core/src/ops/einsum/einsum_matmul.rs | 137 ++++++++++++++++++++++++++-
+ core/src/ops/einsum/prefix_matmul.rs |  38 ++++++++
+ 2 files changed, 174 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/ops/einsum/einsum_matmul.rs b/core/src/ops/einsum/einsum_matmul.rs
+index d2d0f7369..0494a21a6 100644
+--- a/core/src/ops/einsum/einsum_matmul.rs
++++ b/core/src/ops/einsum/einsum_matmul.rs
+@@ -7,7 +7,7 @@ use tract_linalg::pack::PackedFormat;
+ 
+ use super::*;
+ use crate::ops::cast::cast;
+-use crate::ops::math::add;
++use crate::ops::math::{add, mul};
+ use crate::ops::matmul::ModePicker;
+ use crate::ops::matmul::optimized::{
+     AddMatMulGeometry, MapOutputAxisToInput, OptMatMul, ProtoFusedSpec,
+@@ -520,6 +520,19 @@ pub(crate) fn detect_rule(
+     } else {
+         non_trivial_k_axis.first().or_else(|| k_axes.first()).copied()
+     };
++
++    // K=1 short-circuit: when the K product is statically 1 (or no K axis exists), the einsum
++    // collapses to a broadcast multiplication. Lowering it as a matmul leaves the GEMM kernel
++    // doing per-tile setup (clear, panel-load, store) for a single FMA, so a direct broadcast
++    // Mul is much faster.
++    if non_trivial_k_axis.is_empty() && op.q_params.is_none() {
++        if let Some(patch) =
++            try_rewrite_unit_k_as_broadcast_mul(op, model, node, &k_axes, &input_shapes)?
++        {
++            return Ok(Some(patch));
++        }
++    }
++
+     let Some(k_axis) = k_axis else { return inject_k_axis(op, model, node).map(Some) };
+ 
+     let mut possible_m_axes: Vec<_> = op
+@@ -586,6 +599,128 @@ pub(crate) fn detect_rule(
+     .map(Some)
+ }
+ 
++/// Rewrite an EinSum with effective K=1 (or no K axis) as a broadcast Mul.
++///
++/// Preconditions checked here:
++/// - All "k-like" axes (present in both inputs, absent from output) listed in `k_axes`
++///   have shape 1 in both inputs (or `k_axes` is empty).
++/// - There is no "non-trivial single-side disappearing" axis (an axis with non-trivial size
++///   in exactly one input but absent from output) — such axes would require a real reduction
++///   that broadcast Mul cannot express.
++/// - The op is not quantized (q_params is None) — caller must enforce.
++fn try_rewrite_unit_k_as_broadcast_mul(
++    op: &EinSum,
++    model: &TypedModel,
++    node: &TypedNode,
++    k_axes: &[&Axis],
++    input_shapes: &[Cow<[TDim]>],
++) -> TractResult<Option<TypedModelPatch>> {
++    let one = TDim::one();
++    // Reject "non-trivial single-side disappearing" axes — those need a real reduction.
++    for axis in op.axes.iter_all_axes() {
++        let in_left =
++            axis.inputs[0].first().map(|pos| &input_shapes[0][*pos]).unwrap_or(&one) != &one;
++        let in_right =
++            axis.inputs[1].first().map(|pos| &input_shapes[1][*pos]).unwrap_or(&one) != &one;
++        let in_out = !axis.outputs[0].is_empty();
++        if (in_left ^ in_right) && !in_out {
++            return Ok(None);
++        }
++    }
++
++    let c_axes: Vec<char> = op.axes.axes(InOut::Out(0)).map(|a| a.repr).collect();
++    // Need a non-empty output to wire a broadcast Mul.
++    if c_axes.is_empty() {
++        return Ok(None);
++    }
++
++    let k_reprs: TVec<char> = k_axes.iter().map(|a| a.repr).collect();
++    let mut patch = TypedModelPatch::new("EinSum K=1 to broadcast Mul");
++    let mut wires: TVec<OutletId> = patch.taps(model, &node.inputs)?;
++    let name = &node.name;
++
++    for (slot, wire) in wires.iter_mut().enumerate() {
++        // Promote inputs to operating_dt before the Mul so the result type matches
++        // the EinSum's output type (e.g. i8 inputs with i32 operating_dt for an
++        // integer matmul that has been dequantized).
++        let cur_dt = patch.outlet_fact(*wire)?.datum_type;
++        if cur_dt != op.operating_dt {
++            *wire = patch.wire_node(
++                format!("{name}.cast_in{slot}"),
++                cast(op.operating_dt),
++                &[*wire],
++            )?[0];
++        }
++
++        // Drop k axes (sorted descending so positions stay valid).
++        let mut k_positions: Vec<usize> =
++            k_axes.iter().map(|a| a.inputs[slot][0]).collect();
++        k_positions.sort_by(|a, b| b.cmp(a));
++        for (i, pos) in k_positions.into_iter().enumerate() {
++            *wire = patch.wire_node(
++                format!("{name}.rm_k_in{slot}.{i}"),
++                AxisOp::Rm(pos),
++                &[*wire],
++            )?[0];
++        }
++
++        // Track current axis labels for this input.
++        let mut current: Vec<char> = op
++            .axes
++            .axes(InOut::In(slot))
++            .map(|a| a.repr)
++            .filter(|c| !k_reprs.contains(c))
++            .collect();
++
++        // Drop any remaining axes not in output (they must be size 1 by precondition above).
++        let mut to_drop: Vec<(usize, char)> = current
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c_axes.contains(c))
++            .map(|(i, c)| (i, *c))
++            .collect();
++        to_drop.sort_by(|a, b| b.0.cmp(&a.0));
++        for (pos, c) in to_drop {
++            *wire = patch.wire_node(
++                format!("{name}.rm_extra_in{slot}_{c}"),
++                AxisOp::Rm(pos),
++                &[*wire],
++            )?[0];
++            current.remove(pos);
++        }
++
++        // Insert unit axes for output axes missing from this input.
++        for (target_pos, &t) in c_axes.iter().enumerate() {
++            if !current.contains(&t) {
++                *wire = patch.wire_node(
++                    format!("{name}.add_in{slot}_{t}"),
++                    AxisOp::Add(target_pos),
++                    &[*wire],
++                )?[0];
++                current.insert(target_pos, t);
++            }
++        }
++
++        // Permute to match output axis order.
++        for (target_pos, &t) in c_axes.iter().enumerate() {
++            let cur_pos = current.iter().position(|&c| c == t).unwrap();
++            if cur_pos != target_pos {
++                *wire = patch.wire_node(
++                    format!("{name}.move_in{slot}_{t}"),
++                    AxisOp::Move(cur_pos, target_pos),
++                    &[*wire],
++                )?[0];
++                let removed = current.remove(cur_pos);
++                current.insert(target_pos, removed);
++            }
++        }
++    }
++
++    let result = patch.wire_node(name, mul(), &wires)?;
++    patch.shunt_outside(model, node.id.into(), result[0])?;
++    Ok(Some(patch))
++}
++
+ pub(super) fn inject_k_axis(
+     op: &EinSum,
+     model: &TypedModel,
+diff --git a/core/src/ops/einsum/prefix_matmul.rs b/core/src/ops/einsum/prefix_matmul.rs
+index e5cc5d9f4..42fa0660e 100644
+--- a/core/src/ops/einsum/prefix_matmul.rs
++++ b/core/src/ops/einsum/prefix_matmul.rs
+@@ -529,6 +529,44 @@ mod test {
+         .check()
+     }
+ 
++    fn check_k1(expr: &str, a_shape: &[usize], b_shape: &[usize]) -> TractResult<()> {
++        let a_len = a_shape.iter().product::<usize>();
++        let b_len = b_shape.iter().product::<usize>();
++        let a = tensor1(&(0..a_len).map(|i| (i + 1) as f32).collect_vec())
++            .into_shape(a_shape)
++            .unwrap();
++        let b = tensor1(&(0..b_len).map(|i| (i + 7) as f32 * 0.5).collect_vec())
++            .into_shape(b_shape)
++            .unwrap();
++        EinSumProblem { expr: expr.to_string(), a, b }.check()
++    }
++
++    // K=1 means the einsum's contraction degenerates to broadcast-mul. detect_rule
++    // short-circuits to a Mul op rather than dispatching the GEMM kernel for a single
++    // FMA per tile. The gmk,Ngnk->Ngmn pattern with k=1 is what depthwise ConvTranspose
++    // lowers to, and the per-tile GEMM overhead dominates in that case.
++    #[test]
++    fn k1_amk_akn_amn() -> TractResult<()> {
++        check_k1("amk,akn->amn", &[2, 3, 1], &[2, 1, 4])
++    }
++
++    #[test]
++    fn k1_gmk_ngnk_ngmn() -> TractResult<()> {
++        check_k1("gmk,Ngnk->Ngmn", &[3, 2, 1], &[1, 3, 4, 1])
++    }
++
++    #[test]
++    fn k1_mk_kn_mn() -> TractResult<()> {
++        check_k1("mk,kn->mn", &[2, 1], &[1, 3])
++    }
++
++    #[test]
++    fn k1_no_k_axis_outer() -> TractResult<()> {
++        // No k axis at all: outer product. detect_rule injects a fake k=1 axis,
++        // then our short-circuit catches it on the next pass.
++        check_k1("m,n->mn", &[3], &[4])
++    }
++
+     #[test]
+     fn q() -> TractResult<()> {
+         let qp = QParams::ZpScale { zero_point: 0, scale: 0.1 };
+-- 
+2.50.1 (Apple Git-155)
+
