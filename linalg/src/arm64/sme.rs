@@ -1,6 +1,7 @@
 use crate::Ops;
 use crate::frame::mmm::ImplementationQuality::ManuallyOptimized;
 use crate::mmm::*;
+use tract_data::internal::f16;
 
 // CAN_FUSE: everything except LeakyRelu / QScale / RoundingShiftRight /
 // ShiftLeft. LoadTile, AddUnicast, AddRowColProducts, per-row/col/scalar
@@ -18,6 +19,7 @@ const CAN_FUSE: fn(&FusedSpec) -> bool = |f| {
 
 const SME: fn() -> bool = has_sme;
 const SME2: fn() -> bool = has_sme2;
+const SME_F16F16: fn() -> bool = has_sme_f16f16;
 
 MMMExternKernel!(
     sme_mmm_f32_32x32<f32>(32, 32)@(128, 128)
@@ -29,6 +31,16 @@ MMMExternKernel!(
 MMMExternKernel!(
     sme_mmv_f32_64x1<f32>(64, 1)@(128, 128)
     where(SME2)
+    can_fuse(CAN_FUSE)
+    quality(ManuallyOptimized)
+);
+
+// Phase 2B (f16): requires FEAT_SME_F16F16 (M4+, Cortex-X4+, Neoverse V3+
+// with the F16F16 optional extension). Minimal fuse-op coverage for now
+// (AddMatMul + Clear + Store + Done); other ops fall back to scalar.
+MMMExternKernel!(
+    sme_mmm_f16_32x32<f16>(32, 32)@(128, 128)
+    where(SME_F16F16)
     can_fuse(CAN_FUSE)
     quality(ManuallyOptimized)
 );
@@ -135,6 +147,58 @@ pub fn has_sme2() -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
+pub fn has_sme_f16f16() -> bool {
+    // TRACT_SME_DISABLE=1 disables the whole SME stack on the same binary
+    // for A/B testing.
+    if std::env::var_os("TRACT_SME_DISABLE").is_some() {
+        return false;
+    }
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::ptr::null_mut;
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    let Ok(name) = CString::new("hw.optional.arm.FEAT_SME_F16F16") else {
+        return false;
+    };
+    let mut value: u64 = 0;
+    let mut len: usize = std::mem::size_of::<u64>();
+    unsafe {
+        if sysctlbyname(name.as_ptr(), &mut value as *mut _ as *mut c_void, &mut len, null_mut(), 0)
+            != 0
+        {
+            return false;
+        }
+    }
+    value != 0
+}
+
+#[cfg(target_os = "linux")]
+pub fn has_sme_f16f16() -> bool {
+    // HWCAP2_SME_F16F16 = 1 << 60 on aarch64 (kernel ABI). Requires a
+    // sufficiently recent kernel that exposes this bit; falls back to
+    // false on older kernels — which is safe because the kernel
+    // registration gates dispatch via the `where(SME_F16F16)` predicate.
+    const HWCAP2_SME_F16F16: u64 = 1 << 60;
+    unsafe extern "C" {
+        fn getauxval(t: u64) -> u64;
+    }
+    const AT_HWCAP2: u64 = 26;
+    unsafe { (getauxval(AT_HWCAP2) & HWCAP2_SME_F16F16) != 0 }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn has_sme_f16f16() -> bool {
+    false
+}
+
 pub fn plug(ops: &mut Ops) {
     if has_sme() {
         log::info!("SME optimisation activated");
@@ -146,7 +210,12 @@ pub fn plug(ops: &mut Ops) {
         ops.mmv_f32 = Box::new(|_, _| sme_mmv_f32_64x1.mmm());
         ops.mmm_impls.extend_from_slice(&[sme_mmv_f32_64x1.mmm()]);
     }
-    if !has_sme() && !has_sme2() {
+    if has_sme_f16f16() {
+        log::info!("SME f16 (FEAT_SME_F16F16) optimisation activated");
+        ops.mmm_f16 = Box::new(|_, _, _| sme_mmm_f16_32x32.mmm());
+        ops.mmm_impls.extend_from_slice(&[sme_mmm_f16_32x32.mmm()]);
+    }
+    if !has_sme() && !has_sme2() && !has_sme_f16f16() {
         log::info!("No SME optimisation");
     }
 }

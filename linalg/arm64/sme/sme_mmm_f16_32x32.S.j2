@@ -1,0 +1,168 @@
+// vim: ft=arm
+//
+// SME f16 32x32 matmul kernel (Phase 2B).
+//
+// ZA tile layout (1 .H tile, 32x32 each):
+//
+//   ZA0.H : C[0..32, 0..32]
+//
+// Requires FEAT_SME_F16F16 — f16 outer product with f16 accumulator (1 op
+// per cycle on M4). SVL=512 bits → 32 f16 lanes per Z register.
+//
+// Inner K-step: load 32 f16 of A (1 Z reg, 64 bytes) and 32 of B (1 Z reg),
+// issue 1 FMOPA.h into the single ZA .H tile.
+//
+// Calling convention (extern "C", AAPCS64):
+//   x0 = const *FusedKerSpec<f16>, advanced 40 B per dispatcher iteration.
+//   x1 = stack-resident 2 KiB scratch buffer for tile spills.
+//
+// Streaming mode: PSTATE.SM=1 from prologue smstart to epilogue smstop.
+// V0..V31 (low 128 bits = Z0..Z31 low) are destroyed by the smstart/smstop
+// pair; v8..v15 are saved/restored to stack across the streaming region per
+// AAPCS callee-save rules.
+
+.arch armv9-a+sme2+sme-f16f16
+.text
+.align 4
+
+.global {{G}}sme_mmm_f16_32x32_{{suffix}}
+{{G}}sme_mmm_f16_32x32_{{suffix}}:
+
+    // Save callee-saved q8..q15.
+    stp     q8,  q9,  [sp, #-128]!
+    stp     q10, q11, [sp, #32]
+    stp     q12, q13, [sp, #64]
+    stp     q14, q15, [sp, #96]
+
+    // Allocate 2 KiB tile-spill scratch (32 rows × 64 B/row for 32x32 f16).
+    sub     sp, sp, #2048
+    mov     x1, sp
+
+    smstart
+    ptrue   p0.b
+
+{% include "dispatcher.j2" %}
+
+// -------- supported fuse ops ---------------------------------------------
+
+.add_mat_mul:
+    ldr     x2, [x0, #24]       // b
+    ldp     x3, x4, [x0, #8]    // k, a
+
+    cmp     x3, #0
+    b.eq    .non_linear_loop
+
+.Lmatmul_loop:
+    ld1h    {z0.h}, p0/z, [x4]
+    ld1h    {z1.h}, p0/z, [x2]
+    add     x4, x4, #64
+    add     x2, x2, #64
+
+    fmopa   za0.h, p0/m, p0/m, z0.h, z1.h
+
+    subs    x3, x3, #1
+    b.ne    .Lmatmul_loop
+    b       .non_linear_loop
+
+.clear:
+    zero    {za}
+    b       .non_linear_loop
+
+.store:
+    // FusedKerSpec::Store(OutputStoreKer { ptr, row_byte_stride,
+    //                                      col_byte_stride, item_size })
+    //   [x0, #8]  = ptr           [x0, #16] = row_byte_stride
+    //   [x0, #24] = col_byte_stride  [x0, #32] = item_size
+    ldp     x5, x6, [x0, #8]    // x5 = ptr, x6 = row_byte_stride
+    ldp     x7, x8, [x0, #24]   // x7 = col_byte_stride, x8 = item_size
+
+    // Fast path: contiguous f16 columns (col_stride == 2, item_size == 2).
+    cmp     x7, #2
+    b.ne    .Lstore_generic
+    cmp     x8, #2
+    b.ne    .Lstore_generic
+
+    mov     w12, #0
+.Lstore_loop:
+    st1h    {za0h.h[w12, 0]}, p0, [x5]
+    add     x5, x5, x6
+    add     w12, w12, #1
+    cmp     w12, #32
+    b.lt    .Lstore_loop
+    b       .non_linear_loop
+
+.Lstore_generic:
+    // Slow path: spill ZA → x1 (scratch, 32x32 row-major, 64 B/row), then
+    // per-element strided scatter.
+    mov     x4, x1
+    mov     w12, #0
+.Lstore_spill:
+    st1h    {za0h.h[w12, 0]}, p0, [x4]
+    add     x4, x4, #64
+    add     w12, w12, #1
+    cmp     w12, #32
+    b.lt    .Lstore_spill
+
+    // Strided f16 scatter: 32 rows × 32 cols (2 bytes each).
+    mov     x3, #0
+.Lstore_row:
+    mov     x4, x5
+    mov     x10, #0
+    lsl     x9, x3, #6          // row*64 byte offset in scratch
+    add     x11, x1, x9
+.Lstore_col:
+    ldrh    w9, [x11], #2
+    strh    w9, [x4]
+    add     x4, x4, x7
+    add     x10, x10, #1
+    cmp     x10, #32
+    b.lt    .Lstore_col
+    add     x5, x5, x6
+    add     x3, x3, #1
+    cmp     x3, #32
+    b.lt    .Lstore_row
+    b       .non_linear_loop
+
+// -------- Phase 2B-step-1: remaining fuse ops not yet ported -------------
+//
+// scalar_*, per_col_*, per_row_*, add_row_col_products, add_unicast,
+// load_tile all need f16 ports. Stubbed as unsupported for now — when
+// these fire, tract will fall back to the scalar reference.
+
+.scalar_add:
+.scalar_mul:
+.scalar_sub:
+.scalar_sub_flipped:
+.scalar_min:
+.scalar_max:
+.per_col_add:
+.per_col_mul:
+.per_col_sub:
+.per_col_sub_flipped:
+.per_col_min:
+.per_col_max:
+.per_row_add:
+.per_row_mul:
+.per_row_sub:
+.per_row_sub_flipped:
+.per_row_min:
+.per_row_max:
+.add_row_col_products:
+.add_unicast:
+.load_tile:
+.leaky_relu:
+.q_scale:
+.q_shl:
+.q_shr:
+    b       .unsupported
+
+// -------- epilogue --------------------------------------------------------
+
+.return:
+    smstop
+    add     sp, sp, #2048
+    ldp     q14, q15, [sp, #96]
+    ldp     q12, q13, [sp, #64]
+    ldp     q10, q11, [sp, #32]
+    ldp     q8,  q9,  [sp], #128
+    ret
