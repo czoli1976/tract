@@ -238,6 +238,7 @@ unsafe fn run_with_scratch_space_vec<K: MatMatMulKer>(
                 Some(&pool),
                 m.divceil(ker.mr()),
                 1,
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
                 |ia_start, ia_end, _, _| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ia in ia_start..ia_end {
@@ -248,16 +249,20 @@ unsafe fn run_with_scratch_space_vec<K: MatMatMulKer>(
                 },
             ),
             #[cfg(feature = "multithread-mm")]
-            Executor::RayonGlobal => {
-                chunked_dispatch_rayon(None, m.divceil(ker.mr()), 1, |ia_start, ia_end, _, _| {
+            Executor::RayonGlobal => chunked_dispatch_rayon(
+                None,
+                m.divceil(ker.mr()),
+                1,
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
+                |ia_start, ia_end, _, _| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ia in ia_start..ia_end {
                             scratch.run_one_tile(ker, non_linear, tls, ia, 0)?;
                         }
                         TractResult::Ok(())
                     })
-                })
-            }
+                },
+            ),
         }
     }
 }
@@ -284,6 +289,7 @@ unsafe fn run_with_scratch_space_col_outer<K: MatMatMulKer>(
                 Some(&pool),
                 m.divceil(ker.mr()),
                 n.divceil(ker.nr()),
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
                 |ia_start, ia_end, ib_start, ib_end| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ib in ib_start..ib_end {
@@ -300,6 +306,7 @@ unsafe fn run_with_scratch_space_col_outer<K: MatMatMulKer>(
                 None,
                 m.divceil(ker.mr()),
                 n.divceil(ker.nr()),
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
                 |ia_start, ia_end, ib_start, ib_end| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ib in ib_start..ib_end {
@@ -337,6 +344,7 @@ unsafe fn run_with_scratch_space_row_outer<K: MatMatMulKer>(
                 Some(&pool),
                 m.divceil(ker.mr()),
                 n.divceil(ker.nr()),
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
                 |ia_start, ia_end, ib_start, ib_end| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ia in ia_start..ia_end {
@@ -353,6 +361,7 @@ unsafe fn run_with_scratch_space_row_outer<K: MatMatMulKer>(
                 None,
                 m.divceil(ker.mr()),
                 n.divceil(ker.nr()),
+                add_mat_mul_panel_pair_bytes(ker, non_linear),
                 |ia_start, ia_end, ib_start, ib_end| {
                     scratch.run_in_tls_scope(|scratch, tls| {
                         for ia in ia_start..ia_end {
@@ -368,6 +377,55 @@ unsafe fn run_with_scratch_space_row_outer<K: MatMatMulKer>(
     }
 }
 
+/// Per-(M+N)-panel working-set bytes for the first `AddMatMul`:
+/// `K * (mr * a_elt + nr * b_elt)`, i.e. the bytes of one A panel plus one B
+/// panel. Used to size cache-fitting MT chunks. Returns 0 when there is no
+/// `AddMatMul` (caller keeps the base chunk size).
+#[cfg(feature = "multithread-mm")]
+fn add_mat_mul_panel_pair_bytes<K: MatMatMulKer>(ker: &K, non_linear: &[FusedSpec]) -> usize {
+    for spec in non_linear {
+        if let FusedSpec::AddMatMul { a, b, .. } = spec {
+            let elt = |f: &dyn MMMInputFormat| match f.precursor() {
+                crate::WeightType::Plain(dt) => dt.size_of(),
+                _ => std::mem::size_of::<K::Acc>(),
+            };
+            return a.k() * (ker.mr() * elt(a.format()) + ker.nr() * elt(b.format()));
+        }
+    }
+    0
+}
+
+/// L2 working-set budget (bytes) used to cap MT chunk sizes so a chunk's reused
+/// A+B panel block stays cache-resident. Lazily initialised from
+/// `TRACT_MM_CHUNK_L2_BYTES` (0/invalid → default), and runtime-tunable via
+/// [`set_mm_chunk_l2_budget`]. `0` in the atomic means "not yet initialised".
+#[cfg(feature = "multithread-mm")]
+static MM_CHUNK_L2_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "multithread-mm")]
+fn mm_chunk_l2_budget() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = MM_CHUNK_L2_BYTES.load(Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let init = std::env::var("TRACT_MM_CHUNK_L2_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(512 * 1024);
+    MM_CHUNK_L2_BYTES.store(init, Relaxed);
+    init
+}
+
+/// Set the L2 working-set budget (bytes) for cache-adaptive MT chunk sizing.
+/// Larger values keep ggml-style chunks (less shrinking); a very large value
+/// disables the cache cap. Mirrors [`crate::multithread::set_threading_panel_threshold`].
+#[cfg(feature = "multithread-mm")]
+pub fn set_mm_chunk_l2_budget(bytes: usize) {
+    MM_CHUNK_L2_BYTES.store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Chunk grid for the 2D dispatch.
 ///
 /// Mirrors ggml's `mul_mat` heuristic (`ggml/src/ggml-cpu/ggml-cpu.c:1378-1398`):
@@ -376,10 +434,27 @@ unsafe fn run_with_scratch_space_row_outer<K: MatMatMulKer>(
 ///  * fallback to "block-per-thread along the longer axis" when the natural
 ///    grid would have fewer than `4·nth` chunks.
 ///
+/// Cache-adaptive refinement: `panel_pair_bytes` (one A + one B panel) lets us
+/// shrink the chunk below the ggml base when K is large enough that a base-sized
+/// chunk's reused panel block would exceed `mm_chunk_l2_budget()`. For small/medium
+/// K this is identical to ggml (clamped to the base); it never grows the chunk, so
+/// load-balancing across workers is unaffected. `panel_pair_bytes == 0` disables it.
+///
 /// Returns `(nchunks_m, nchunks_n, dr_m, dr_n)`.
 #[cfg(feature = "multithread-mm")]
-fn chunk_grid(n_panels_m: usize, n_panels_n: usize, nth: usize) -> (usize, usize, usize, usize) {
-    let chunk_size = if n_panels_m == 1 || n_panels_n == 1 { 64 } else { 16 };
+fn chunk_grid(
+    n_panels_m: usize,
+    n_panels_n: usize,
+    nth: usize,
+    panel_pair_bytes: usize,
+) -> (usize, usize, usize, usize) {
+    let base = if n_panels_m == 1 || n_panels_n == 1 { 64 } else { 16 };
+    // panel_pair_bytes == 0 (no AddMatMul) → checked_div is None → keep base.
+    // Floor at 4: never collapse to tiny chunks (over-shrinking at very large K
+    // both thrashes per-chunk amortization and regresses — measured).
+    let floor = 4.min(base);
+    let chunk_size =
+        mm_chunk_l2_budget().checked_div(panel_pair_bytes).map_or(base, |c| c.clamp(floor, base));
     let mut nchunks_m = n_panels_m.div_ceil(chunk_size);
     let mut nchunks_n = n_panels_n.div_ceil(chunk_size);
     if nchunks_m * nchunks_n < 4 * nth {
@@ -420,6 +495,7 @@ unsafe fn chunked_dispatch_rayon<F>(
     pool: Option<&rayon::ThreadPool>,
     n_panels_m: usize,
     n_panels_n: usize,
+    panel_pair_bytes: usize,
     run_chunk: F,
 ) -> TractResult<()>
 where
@@ -437,7 +513,8 @@ where
     let use_global = pool.is_none_or(|p| p.current_num_threads() <= 1);
     let body = || {
         let nth = rayon::current_num_threads();
-        let (nchunks_m, nchunks_n, dr_m, dr_n) = chunk_grid(n_panels_m, n_panels_n, nth);
+        let (nchunks_m, nchunks_n, dr_m, dr_n) =
+            chunk_grid(n_panels_m, n_panels_n, nth, panel_pair_bytes);
         let total = nchunks_m * nchunks_n;
         (0..total).into_par_iter().try_for_each(|idx| {
             let im = idx % nchunks_m;
