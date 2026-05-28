@@ -9,6 +9,7 @@ pub mod by_scalar;
 mod intel;
 pub mod max;
 pub mod panel_extract;
+pub mod rms_norm;
 pub mod softmax;
 
 const AVX2: fn() -> bool = || is_x86_feature_detected!("avx2");
@@ -33,7 +34,10 @@ fn plug_fma(ops: &mut Ops) {
     log::info!("sigmoid_f32, tanh_f32: x86_64/fma activated");
 }
 
-fn plug_avx512f(_ops: &mut Ops) {}
+fn plug_avx512f(ops: &mut Ops) {
+    ops.rms_norm_f32 = Box::new(rms_norm::rms_norm_f32);
+    log::info!("rms_norm_f32: x86_64/avx512f activated");
+}
 
 pub fn plug(ops: &mut Ops) {
     mmm::plug(ops);

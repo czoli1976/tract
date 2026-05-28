@@ -104,6 +104,10 @@ name = "softmax"
 harness = false
 
 [[bench]]
+name = "rms_norm"
+harness = false
+
+[[bench]]
 bench = false
 name = "arm64simd"
 harness = false
