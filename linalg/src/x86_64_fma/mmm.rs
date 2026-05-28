@@ -2,7 +2,7 @@ use crate::Ops;
 use crate::block_quant::*;
 use crate::mmm::ImplementationQuality::ManuallyOptimized;
 use crate::mmm::MatMatMul;
-use crate::pack::PackedFormat;
+use crate::pack::{PackedFormat, PackedI8K4};
 
 use super::*;
 
@@ -91,6 +91,17 @@ MMMExternKernel! { avx2_mmm_i32_8x8<i32>(8,8)@(256,4) where(AVX2)
     store(i8)
 }
 
+// AVX-512 VNNI int8 GEMM: same 8x8 column-accumulator tile and quantization
+// epilogue as avx2_mmm_i32_8x8, but the i8i8 matmul inner loop uses VPDPBUSD
+// (4-way K dot) over the K=4-inner PackedI8K4 layout. VPDPBUSD is u8*s8, so the
+// kernel offsets A by +128 and removes the 128*sum_k(B) bias per column before
+// the epilogue, making the i32 accumulators bit-identical to the AVX2 path.
+MMMExternKernel! { avx512vnni_mmm_i32_8x8<i32>(8,8)@(256,4) where(AVX512VNNI)
+    packing[1] = i8i8 => |k| k.with_packing(PackedI8K4::new(8), PackedI8K4::new(8));
+    quality(ManuallyOptimized)
+    store(i8)
+}
+
 pub fn plug(ops: &mut Ops) {
     if is_x86_feature_detected!("avx2") {
         plug_avx2(ops);
@@ -98,9 +109,18 @@ pub fn plug(ops: &mut Ops) {
             plug_fma(ops);
             if is_x86_feature_detected!("avx512f") {
                 plug_avx512f(ops);
+                if is_x86_feature_detected!("avx512vnni") {
+                    plug_avx512vnni(ops);
+                }
             }
         }
     }
+}
+
+pub fn plug_avx512vnni(ops: &mut Ops) {
+    ops.mmm_impls.push(avx512vnni_mmm_i32_8x8.mmm());
+    ops.qmmm_i32 = Box::new(|_, _, _| avx512vnni_mmm_i32_8x8.mmm());
+    log::info!("qmmm_i32: x86_64/avx512vnni activated");
 }
 
 pub fn plug_avx2(ops: &mut Ops) {
