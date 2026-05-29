@@ -46,16 +46,18 @@ model_prefix=$MODELS/$S3DIR/$MODEL
 # Check that the patch transform eliminates all Iff nodes,
 # and that select_outputs can reduce the model to a single output
 $TRACT_RUN $model_prefix.preprocessor.nnef.tgz \
-	-t 'concretize_symbols(values: {"BATCH": 1})' \
+	-t 'set_symbols(values: {"BATCH": 1})' \
 	-t 'patch(body: "length = tract_core_shape_of(input_signal)[1];")' \
+	-t 'select_inputs(inputs: ["input_signal"])' \
 	-t 'select_outputs(outputs: ["processed_signal"])' \
 	dump -q \
 	--assert-op-count Iff 0
 
 # Check that the preprocessor can be pulsified
 $TRACT_RUN $model_prefix.preprocessor.nnef.tgz \
-	-t 'concretize_symbols(values: {"BATCH": 1})' \
+	-t 'set_symbols(values: {"BATCH": 1})' \
 	-t 'patch(body: "length = tract_core_shape_of(input_signal)[1];")' \
+	-t 'select_inputs(inputs: ["input_signal"])' \
 	-t 'select_outputs(outputs: ["processed_signal"])' \
 	-t 'pulse(symbol: Some("INPUT_SIGNAL__TIME"), pulse: "4800")' \
 	dump -q
@@ -79,14 +81,14 @@ do
 		*) continue;;
 	esac
 	$TRACT_RUN $model_prefix.preprocessor.nnef.tgz $rt \
-		-t 'concretize_symbols(values: {"BATCH": 1})' \
+		-t 'set_symbols(values: {"BATCH": 1})' \
 		-t 'patch(body: "length = tract_core_shape_of(input_signal)[1];")' \
 		-t 'select_outputs(outputs: ["processed_signal"])' \
 		-t 'pulse(symbol: Some("INPUT_SIGNAL__TIME"), pulse: "4800")' \
 		dump -q $pp_assert
 	$TRACT_RUN $model_prefix.encoder.p1.nnef.tgz $rt \
 		--nnef-tract-transformers \
-		-t 'concretize_symbols(values: {"BATCH": 1})' \
+		-t 'set_symbols(values: {"BATCH": 1})' \
 		-t 'patch(body: "length = tract_core_shape_of(audio_signal)[2];")' \
 		-t 'select_outputs(outputs: ["outputs"])' \
 		-t 'pulse(symbol: Some("AUDIO_SIGNAL__TIME"), pulse: "112")' \
@@ -99,8 +101,9 @@ done
 # must be 14 * 8 = 112 audio frames.
 $TRACT_RUN $model_prefix.encoder.p1.nnef.tgz \
 	--nnef-tract-transformers \
-	-t 'concretize_symbols(values: {"BATCH": 1})' \
+	-t 'set_symbols(values: {"BATCH": 1})' \
 	-t 'patch(body: "length = tract_core_shape_of(audio_signal)[2];")' \
+	-t 'select_inputs(inputs: ["audio_signal"])' \
 	-t 'select_outputs(outputs: ["outputs"])' \
 	-t 'pulse(symbol: Some("AUDIO_SIGNAL__TIME"), pulse: "112")' \
 	dump -q
@@ -110,8 +113,9 @@ $TRACT_RUN $model_prefix.encoder.p1.nnef.tgz \
 # and the output comparison is trimmed accordingly.
 $TRACT_RUN $model_prefix.encoder.p1.nnef.tgz \
 	--nnef-tract-transformers \
-	-t 'concretize_symbols(values: {"BATCH": 1})' \
+	-t 'set_symbols(values: {"BATCH": 1})' \
 	-t 'patch(body: "length = tract_core_shape_of(audio_signal)[2];")' \
+	-t 'select_inputs(inputs: ["audio_signal"])' \
 	-t 'select_outputs(outputs: ["outputs"])' \
 	-t 'pulse(symbol: Some("AUDIO_SIGNAL__TIME"), pulse: "112")' \
 	run \
