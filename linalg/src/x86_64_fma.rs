@@ -5,6 +5,8 @@ use crate::x86_64_fma::softmax::x86_64_fma_softmax2_fastcompact_f32_32n;
 
 pub mod mmm;
 
+#[cfg(tract_amx_int8)]
+pub mod amx;
 pub mod by_scalar;
 mod intel;
 pub mod max;
