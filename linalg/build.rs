@@ -37,6 +37,24 @@ fn assembler_supports_sme() -> bool {
         .is_ok()
 }
 
+// Probe whether the target assembler can actually assemble Intel AMX int8
+// instructions (`ldtilecfg`, `tilezero`, `tdpbusd`, `tilerelease`). Older
+// binutils (e.g. Debian stretch's gas 2.28) predate AMX and reject these
+// mnemonics outright, which would break the x86_64 build for users on those
+// toolchains. When the probe fails we skip the AMX kernel entirely; the
+// matching `tract_amx_int8` cfg keeps the Rust side from referencing the
+// (absent) kernel symbol, and `qmmm_i32` dispatch falls back to VNNI (or
+// AVX2 when VNNI is itself unavailable).
+fn assembler_supports_amx_int8() -> bool {
+    cc::Build::new()
+        .file("x86_64/avx512amx/dummy.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_amx_int8_probe")
+        .is_ok()
+}
+
 fn include_sve() -> bool {
     // SVE/SVE2 lives on ARMv9 server/mobile cores (Neoverse V1+/N2+, Cortex-X2+,
     // Graviton 3/4) — Linux aarch64. No Apple silicon has SVE.
@@ -130,6 +148,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(tract_sme)");
     // Set below only when include_sve() and the SVE compiler probe both pass.
     println!("cargo:rustc-check-cfg=cfg(tract_sve)");
+    // Set below only when the x86_64 assembler accepts AMX int8 mnemonics
+    // (avoids breaking the build on toolchains predating AMX).
+    println!("cargo:rustc-check-cfg=cfg(tract_amx_int8)");
 
     match arch.as_ref() {
         "x86_64" => {
@@ -183,6 +204,24 @@ fn main() {
                 }
             } else {
                 cc::Build::new().files(files).flag("-mfma").compile("x86_64_fma");
+            }
+
+            // AMX int8 kernel lives in its own subdirectory so it can be
+            // gated behind a build-time assembler probe. Unix only for now;
+            // the kernel uses the GAS intel-syntax path. The `tract_amx_int8`
+            // cfg gates the Rust-side symbol reference: when the probe fails
+            // on old toolchains (e.g. Debian stretch's binutils 2.28), the
+            // kernel is omitted and `qmmm_i32` dispatch falls back to VNNI
+            // or AVX2 with no build error.
+            if os != "windows" && assembler_supports_amx_int8() {
+                let amx_files =
+                    preprocess_files("x86_64/avx512amx", &[], &suffix, false);
+                if !amx_files.is_empty() {
+                    cc::Build::new()
+                        .files(&amx_files)
+                        .compile("x86_64_avx512amx");
+                    println!("cargo:rustc-cfg=tract_amx_int8");
+                }
             }
         }
         "arm" | "armv7" => {
