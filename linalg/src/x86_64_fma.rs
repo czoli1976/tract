@@ -7,7 +7,6 @@ pub mod mmm;
 
 pub mod act;
 
-#[cfg(tract_amx_int8)]
 pub mod amx;
 pub mod by_scalar;
 mod intel;
