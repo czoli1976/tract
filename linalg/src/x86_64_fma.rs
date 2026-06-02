@@ -9,6 +9,7 @@ pub mod act;
 
 pub mod amx;
 pub mod amx_bf16;
+pub mod avxvnni;
 pub mod by_scalar;
 mod intel;
 pub mod max;
