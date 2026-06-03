@@ -6,6 +6,10 @@ use crate::x86_64_fma::softmax::x86_64_fma_softmax2_fastcompact_f32_32n;
 pub mod mmm;
 
 pub mod act;
+
+pub mod amx;
+pub mod amx_bf16;
+pub mod avxvnni;
 pub mod by_scalar;
 mod intel;
 pub mod max;
