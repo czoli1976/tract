@@ -35,6 +35,7 @@ members = [
     "examples/keras-tract-tf2",
     "examples/nemo-parakeet-asr",
     "examples/nemo-nemotron-asr",
+    "examples/nemo-nemotron-streaming-asr",
     "examples/nnef-dump-mobilenet-v2",
     "examples/nnef-mobilenet-v2",
     "examples/onnx-mobilenet-v2",
@@ -44,6 +45,7 @@ members = [
     "examples/stable-diffusion",
     "examples/stable-diffusion-3",
     "examples/stable-diffusion-xl",
+    "examples/wasm-model-bench",
 
     "harness/core-proptest-pulse",
     "harness/nnef-inceptionv3",
@@ -55,7 +57,6 @@ members = [
     "test-rt/suite-unit",
     "test-rt/suite-onnx",
     "test-rt/test-f16",
-    "test-rt/test-blas",
     "test-rt/test-metal",
     "test-rt/test-cuda",
     "test-rt/test-unit-core",
@@ -109,7 +110,6 @@ default-members = [
     "test-rt/suite-unit",
     "test-rt/suite-onnx",
     "test-rt/test-f16",
-    "test-rt/test-blas",
     "test-rt/test-unit-core",
     "test-rt/test-onnx-core",
     "test-rt/test-nnef-cycle",
@@ -119,7 +119,6 @@ default-members = [
 rust-version = "1.91"
 
 [workspace.dependencies]
-accelerate-src = "0.3"
 anstyle = "1.0.2"
 anstyle-parse = "1.0.0"
 anstyle-query = "1.0.0"
@@ -182,7 +181,6 @@ num-complex = "0.4.0"
 num-integer = "0.1.44"
 num-traits = "0.2.14"
 num_cpus = "1"
-openblas-src = { version = "0.10", features = ["static"] }
 parking_lot = "0.12.3"
 pastey = "0.2"
 proptest = "1.0.0"
@@ -196,7 +194,7 @@ readings-probe = "0.1.8"
 regex = "1.5.4"
 ron = "0.12"
 reqwest = { version = "0.13", features = [ "blocking", "rustls-no-provider" ], default-features = false }
-rustfft = { version = "6.1", features = [ "neon" ] }
+rustfft = { version = "6.1", features = [ "neon", "wasm_simd" ] }
 rustls = { version = "0.23", default-features = false, features = [ "ring", "std", "tls12" ] }
 webpki-roots = "1"
 safetensors = "0.7"
@@ -205,19 +203,19 @@ serde = { version = "1.0.127", features = [ "derive" ] }
 serde_json = "1.0"
 simd-adler32 = { version = "0.3.7", features = ["std"] }
 smallvec = "1.6.1"
-string-interner = "0.19"
+string-interner = "0.20"
 tar = "0.4.37"
 tempfile = "3.8"
 tensorflow = "0.21.0"
 tflitec = { git = "https://github.com/kali/tflitec-rs.git", rev="9ceb838" }
 time = "0.3.23"
-tokenizers = "0.22"
+tokenizers = "0.23"
 unicode-normalization = "0.1.19"
 walkdir = "2.3.2"
 zerofrom = "0.1.5"
 tract-api = { version = "=0.23.0-dev.4", path = 'api' }
 tract-core = { version = "0.23.0-pre", path = 'core' }
-tract-cuda = { version = "0.23.0-pre", path = 'cuda' }
+tract-cuda = { version = "0.23.0-pre", path = 'cuda', default-features = false }
 tract-data = { version = "0.23.0-pre", path = 'data' }
 tract-extra = { version = "0.23.0-pre", path = 'extra' }
 tract-gpu = { version = "0.23.0-pre", path = 'gpu' }

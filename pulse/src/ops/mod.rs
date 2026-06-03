@@ -9,6 +9,7 @@ use tract_pulse_opl::ops::Delay;
 pub mod array;
 pub mod cnn;
 pub mod delay;
+pub mod diag_gather;
 pub mod downsample;
 pub mod dummy;
 pub mod fft;
@@ -16,6 +17,7 @@ pub mod mask;
 pub mod scan;
 pub mod slice;
 pub mod source;
+pub mod window;
 
 pub(crate) fn sync_inputs(
     node: &TypedNode,
@@ -49,7 +51,7 @@ pub(crate) fn sync_inputs(
     Ok(inputs)
 }
 
-register_all_mod!(array, cnn, downsample, fft, scan, source);
+register_all_mod!(array, cnn, diag_gather, downsample, fft, scan, source, window);
 
 type PulsifierFn = fn(
     &TypedModel,

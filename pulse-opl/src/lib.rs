@@ -6,7 +6,9 @@ mod deconv_delay;
 mod delay;
 mod mask;
 mod pad;
+mod range;
 mod slice;
+mod window;
 
 pub use tract_nnef;
 pub use tract_nnef::tract_core;
@@ -21,7 +23,9 @@ pub mod ops {
     pub use super::delay::{Delay, DelayState};
     pub use super::mask::PulseMask;
     pub use super::pad::PulsePad;
+    pub use super::range::PulsedRange;
     pub use super::slice::PulsedAxisSlice;
+    pub use super::window::WindowOnAxis;
 }
 
 pub trait WithPulse {
@@ -31,7 +35,6 @@ pub trait WithPulse {
 
 impl WithPulse for tract_nnef::framework::Nnef {
     fn enable_pulse(&mut self) {
-        self.enable_tract_core();
         self.registries.push(tract_nnef_registry());
     }
     fn with_pulse(mut self) -> Self {

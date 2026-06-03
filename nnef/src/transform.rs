@@ -34,7 +34,7 @@ impl ModelTransform for PatchTransform {
 
         // Run the builder in a block so it (and its borrow of model) is dropped before we mutate model
         let (patch_model, taps, scope) = {
-            let framework = crate::nnef().with_tract_core();
+            let framework = crate::nnef();
 
             let doc = Document {
                 version: "1.0".into(),
@@ -65,11 +65,9 @@ impl ModelTransform for PatchTransform {
             let taps_ref = &mut taps;
             builder.wire_resolver =
                 Some(Box::new(move |name: &str, patch_model: &mut TypedModel| {
-                    let Some(node_id) =
-                        model_ref.nodes.iter().find(|n| n.name == name).map(|n| n.id)
-                    else {
-                        return Ok(None);
-                    };
+                    rule_if_some!(
+                        node_id = model_ref.nodes.iter().find(|n| n.name == name).map(|n| n.id)
+                    );
                     let original_outlet = OutletId::new(node_id, 0);
                     let fact = model_ref.outlet_fact(original_outlet)?.clone();
                     let patch_outlet = patch_model.add_source(name, fact)?;

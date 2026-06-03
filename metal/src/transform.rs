@@ -167,9 +167,7 @@ fn try_make_metal_op(
     });
 
     let input_facts = source.node_input_facts(node.id)?;
-    if !input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type)) {
-        return Ok(None);
-    }
+    rule_if!(input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type)));
 
     // Copy-based ops are fully generic (no backend-specific dispatch needed).
     if let Some(op) = tract_gpu::ops::copy_based::try_make_copy_based_op(source, node)? {
@@ -234,8 +232,37 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Met
             }
         }
 
-        // Single-op translation
-        if let Some(gpu_op) = try_make_metal_op(source, node)? {
+        // Single-op translation.  See the matching CUDA path for rationale:
+        // pre-check the gpu_op's output_facts against the already-translated
+        // target-side input shapes before wiring, so a stale Reshape (e.g.
+        // after pulsification has changed an upstream axis size) falls back
+        // to CPU rather than aborting the whole Metal transform.
+        let target_inputs: TVec<TypedFact> = node
+            .inputs
+            .iter()
+            .map(|i| target.outlet_fact(mapping[i]).map(|f| f.clone()))
+            .collect::<TractResult<_>>()?;
+        // Mirror sync_inputs_if_required(ToDevice): wrap non-device facts as
+        // device facts so the GPU op's `output_facts` sees uniform device
+        // inputs, matching what it'll receive after sync nodes are wired.
+        // Mixed inputs (e.g. host kv-cache + device current activation) make
+        // `output_facts` bail with "Inconsistent facts", wrongly tripping CPU
+        // fallback.
+        let target_inputs_post_sync: TVec<TypedFact> = target_inputs
+            .iter()
+            .map(|f| -> TractResult<TypedFact> {
+                if f.as_device_fact().is_some() {
+                    Ok(f.clone())
+                } else {
+                    Ok(tract_gpu::fact::DeviceFact::from_host(f.clone())?.into_exotic_fact())
+                }
+            })
+            .collect::<TractResult<_>>()?;
+        let target_input_post_sync_refs: TVec<&TypedFact> =
+            target_inputs_post_sync.iter().collect();
+        if let Some(gpu_op) = try_make_metal_op(source, node)?
+            && gpu_op.output_facts(&target_input_post_sync_refs).is_ok()
+        {
             let device_inputs =
                 sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
             let outlet_ids = target.wire_node(node.name.clone(), gpu_op, &device_inputs)?;

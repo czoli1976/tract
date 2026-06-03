@@ -1,8 +1,6 @@
 use std::borrow::Cow;
 
 use crate::internal::*;
-#[cfg(feature = "blas")]
-use crate::ops::einsum::as_blas::AsBlas;
 use crate::ops::matmul::de_block_quant::BlockQuantTransform;
 use std::fmt::Debug;
 
@@ -248,9 +246,18 @@ pub fn get_transform_with_params(
     Ok(None)
 }
 
+/// Per-symbol substitution: either a concrete integer or a TDim
+/// expression string parsed against the model's symbol scope.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SymbolValueSpec {
+    Int(i64),
+    Expr(String),
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ConcretizeSymbolsConfig {
-    pub values: std::collections::HashMap<String, i64>,
+    pub values: std::collections::HashMap<String, SymbolValueSpec>,
 }
 
 #[derive(Debug)]
@@ -262,11 +269,19 @@ impl ModelTransform for ConcretizeSymbolsTransform {
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        let mut table = SymbolValues::default();
-        for (k, v) in &self.0.values {
-            table = table.with(&model.symbols.sym(k), *v);
+        let mut subs = std::collections::HashMap::new();
+        for (k, spec) in &self.0.values {
+            let sym = model.symbols.sym(k);
+            let dim = match spec {
+                SymbolValueSpec::Int(v) => TDim::Val(*v),
+                SymbolValueSpec::Expr(s) => model
+                    .symbols
+                    .parse_tdim(s)
+                    .with_context(|| format!("Parsing TDim expression {s:?} for symbol {k}"))?,
+            };
+            subs.insert(sym, dim);
         }
-        *model = model.concretize_dims(&table)?;
+        *model = model.substitute_symbols(&subs)?;
         Ok(())
     }
 }
@@ -275,9 +290,54 @@ register_model_transform!("concretize_symbols", ConcretizeSymbolsConfig, |config
     ConcretizeSymbolsTransform(config)
 )));
 
+/// Ad-hoc fix-up for NNEF artifacts exported before Scan grew the
+/// `external_state` flag (issue #2157). For every Scan in the model:
+/// 1. Substitute the scan-axis symbol on the Scan input with 1 across the
+///    whole model (caller is bound by the per-call seq=1 contract that
+///    external state management implies).
+/// 2. Set `external_state = true`.
+///
+/// After this transform, the standard declutter pipeline sees `iters == 1`
+/// on each Scan and `declutter_single_loop` inlines the body. Apply only
+/// when the loaded model is known to use external state management, e.g.
+/// the parakeet decoder. Cheaper than re-exporting cached NNEF.
+#[derive(Debug)]
+struct ForceScanExternalState;
+
+impl ModelTransform for ForceScanExternalState {
+    fn name(&self) -> StaticName {
+        "force_scan_external_state".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        use crate::ops::scan::{InputMapping, Scan};
+        let mut subs: HashMap<Symbol, TDim> = HashMap::new();
+        for node in &model.nodes {
+            let Some(scan) = node.op_as::<Scan>() else { continue };
+            for (slot, mapping) in scan.input_mapping.iter().enumerate() {
+                let InputMapping::Scan(info) = mapping else { continue };
+                let outer = node.inputs[slot];
+                let dim = &model.outlet_fact(outer)?.shape[info.axis];
+                if let TDim::Sym(s) = dim {
+                    subs.insert(s.clone(), TDim::Val(1));
+                }
+            }
+        }
+        if !subs.is_empty() {
+            *model = model.substitute_symbols(&subs)?;
+        }
+        for node in &mut model.nodes {
+            if let Some(scan) = node.op_as_mut::<Scan>() {
+                scan.external_state = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+register_simple_model_transform!("force_scan_external_state", ForceScanExternalState);
+
 register_simple_model_transform!("softmax_fast_compact", SoftmaxFastCompact);
-#[cfg(feature = "blas")]
-register_simple_model_transform!("as_blas", AsBlas);
 register_simple_model_transform!("block_quant", BlockQuantTransform);
 
 #[derive(Debug, serde::Deserialize, Default)]

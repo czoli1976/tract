@@ -92,8 +92,8 @@ impl NnefInterface for Nnef {
         Ok(Model(m))
     }
 
-    fn enable_tract_core(&mut self) -> Result<()> {
-        self.0.enable_tract_core();
+    fn disable_tract_core(&mut self) -> Result<()> {
+        self.0.disable_tract_core();
         Ok(())
     }
 
@@ -410,7 +410,7 @@ impl RunnableInterface for Runnable {
                 &self.0,
                 &BenchLimits::default(),
                 &mut annotations,
-                &RunTensors { sources: vec![inputs] },
+                &RunTensors { sources: vec![inputs], streaming_input_len: None },
                 None,
                 true,
             )?;

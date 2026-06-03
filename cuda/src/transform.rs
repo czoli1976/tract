@@ -135,9 +135,7 @@ fn try_make_cuda_op(
     });
 
     let input_facts = source.node_input_facts(node.id)?;
-    if !input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type)) {
-        return Ok(None);
-    }
+    rule_if!(input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type)));
 
     // Copy-based ops are fully generic (no backend-specific dispatch needed).
     if let Some(op) = tract_gpu::ops::copy_based::try_make_copy_based_op(source, node)? {
@@ -448,8 +446,61 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
             }
         }
 
-        // Single-op translation
-        if let Some(gpu_op) = try_make_cuda_op(source, node)? {
+        // Single-op translation.  Pre-check that the gpu_op accepts the
+        // already-translated target-side input facts: some translators
+        // (notably the AxisOp path: GpuAxisOp can carry a `Reshape(from,
+        // to)` whose dims were synthesised from the source shape, but an
+        // upstream node may have been translated into a different shape
+        // — e.g. pulsification of an upstream matmul producing a smaller
+        // axis).  Without the pre-check, those stale reshapes pass
+        // try_make_cuda_op and then bail inside `wire_node`'s output_facts
+        // call, aborting the entire CUDA transform.  Fall back to the CPU
+        // op so the model stays runnable.
+        // Snapshot target-side input facts before any further mutation; clone
+        // out so we release the borrow on `target` before wiring below.
+        let target_inputs: TVec<TypedFact> = node
+            .inputs
+            .iter()
+            .map(|i| target.outlet_fact(mapping[i]).map(|f| f.clone()))
+            .collect::<TractResult<_>>()?;
+        // Mirror what `sync_inputs_if_required(ToDevice)` will do at wire time:
+        // wrap any non-device input as a device fact so the GPU op's
+        // `output_facts` sees the same uniform device-fact inputs it will get
+        // after sync nodes are inserted.  Without this, mixed host/device
+        // inputs (e.g. an LLM kv-cache concat: host past + device current) make
+        // `output_facts` bail with "Inconsistent facts", wrongly tripping the
+        // CPU fallback.
+        let target_inputs_post_sync: TVec<TypedFact> = target_inputs
+            .iter()
+            .map(|f| -> TractResult<TypedFact> {
+                if f.as_device_fact().is_some() {
+                    Ok(f.clone())
+                } else {
+                    Ok(tract_gpu::fact::DeviceFact::from_host(f.clone())?.into_exotic_fact())
+                }
+            })
+            .collect::<TractResult<_>>()?;
+        let target_input_post_sync_refs: TVec<&TypedFact> =
+            target_inputs_post_sync.iter().collect();
+        let force_cpu = std::env::var("TRACT_CUDA_FORCE_CPU")
+            .ok()
+            .map(|s| s.split(',').any(|pat| !pat.is_empty() && node.name.contains(pat)))
+            .unwrap_or(false);
+        let maybe_gpu_op = if force_cpu { None } else { try_make_cuda_op(source, node)? };
+        if let Some(ref op) = maybe_gpu_op
+            && std::env::var("TRACT_CUDA_TRANSLATE_DEBUG").is_ok()
+            && let Err(e) = op.output_facts(&target_input_post_sync_refs)
+        {
+            eprintln!(
+                "cuda-translate-fallback: {} ({}) inputs={:?} -> {e:?}",
+                node.name,
+                op.name(),
+                target_inputs_post_sync,
+            );
+        }
+        if let Some(gpu_op) = maybe_gpu_op
+            && gpu_op.output_facts(&target_input_post_sync_refs).is_ok()
+        {
             let device_inputs =
                 sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
             let outlet_ids = target.wire_node(node.name.clone(), gpu_op, &device_inputs)?;

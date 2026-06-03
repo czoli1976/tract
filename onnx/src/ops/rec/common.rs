@@ -246,11 +246,8 @@ impl CommonRec {
             });
         }
 
-        let scan_outputs = target.wire_node(
-            prefix,
-            tract_core::ops::scan::Scan::new(body, input_mapping, output_mapping, 0)?,
-            &outer_inputs,
-        )?;
+        let scan = tract_core::ops::scan::Scan::new(body, input_mapping, output_mapping, 0)?;
+        let scan_outputs = target.wire_node(prefix, scan, &outer_inputs)?;
 
         let mut result = tvec!();
         if let Some(slot) = self.optional_y_output {

@@ -5,7 +5,6 @@ use crate::internal::*;
 use crate::model::{TypedModel, TypedNode};
 use crate::ops::identity::Identity;
 use AxisOp::*;
-use num_traits::One;
 use tract_itertools::Itertools;
 use tract_linalg::block_quant::{BlockQuantFact, BlockQuantStorage};
 use tract_ndarray::{ArrayViewD, ArrayViewMutD};
@@ -326,7 +325,17 @@ impl AxisOp {
             Reshape(at, from, to) => {
                 let from_volume = from.iter().product::<TDim>();
                 let to_volume = to.iter().product::<TDim>();
-                ensure!(from_volume == to_volume, "{from_volume} should be equal to {to_volume}");
+                // Two algebraically equal volumes can land in different
+                // factored forms when the same dimension is built two ways
+                // (e.g. (B+2BY)·(1+Y) vs B·(1+Y)·(1+2Y) on Conformer-style
+                // streaming attention).  Compare polynomial expansions so
+                // structural mismatch on factor ordering doesn't fail the
+                // check.
+                ensure!(
+                    from_volume.clone().expand_polynomial()
+                        == to_volume.clone().expand_polynomial(),
+                    "{from_volume} should be equal to {to_volume}"
+                );
                 ensure!(*at + from.len() <= shape.len());
                 if shape.len() >= from.len() + *at
                     && tract_itertools::izip!(shape.iter().skip(*at), from)
@@ -657,7 +666,8 @@ impl EvalOp for AxisOp {
 }
 
 /// Remap coordinate symbols in a TDim expression according to an AxisOp.
-/// Returns None if the remapping cannot be determined (e.g. general reshape).
+/// Returns None if the remapping cannot be determined (e.g. general reshape
+/// with both ends > 1).
 fn remap_uniform_tdim(expr: &TDim, axis_op: &AxisOp) -> Option<TDim> {
     let syms = expr.symbols();
     let coord_syms: Vec<(usize, Symbol)> = syms
@@ -673,13 +683,76 @@ fn remap_uniform_tdim(expr: &TDim, axis_op: &AxisOp) -> Option<TDim> {
         return Some(expr.clone());
     }
 
-    // Reshape: only handle trivial all-ones case.
-    if let AxisOp::Reshape(_, from_dims, to_dims) = axis_op.canonical().as_ref() {
-        return if from_dims.iter().all(|d| d.is_one()) && to_dims.iter().all(|d| d.is_one()) {
-            Some(expr.clone())
-        } else {
-            None
-        };
+    if let AxisOp::Reshape(at, from_dims, to_dims) = axis_op.canonical().as_ref() {
+        // Trivial all-ones case: shape change is purely cosmetic, value is unaffected.
+        if from_dims.iter().all(|d| d.is_one()) && to_dims.iter().all(|d| d.is_one()) {
+            return Some(expr.clone());
+        }
+        // Pure split: from = [D], to = [d_0, …, d_{k-1}], Π = D.  The input
+        // axis-`at` position decomposes as
+        //     pos[at] = Σ_i pos[at+i]_new · stride_i
+        // with `stride_i = Π_{j>i} to_dims[j]` (last stride is 1).  Other
+        // input axes shift right by `k-1` (the net rank change).
+        if from_dims.len() == 1 {
+            let from_dim = from_dims[0].clone();
+            let to_product: TDim = to_dims.iter().fold(TDim::Val(1), |acc, d| acc * d.clone());
+            if to_product == from_dim {
+                let k_to = to_dims.len();
+                let mut map: HashMap<Symbol, TDim> = HashMap::default();
+                for (k, sym) in &coord_syms {
+                    let scope = sym.scope()?;
+                    let new_expr = if *k < *at {
+                        TDim::Sym(sym.clone())
+                    } else if *k == *at {
+                        let mut sum = TDim::Val(0);
+                        let mut stride = TDim::Val(1);
+                        for i in (0..k_to).rev() {
+                            let new_sym = scope.coord_sym(*at + i);
+                            sum = sum + TDim::Sym(new_sym) * stride.clone();
+                            stride = stride * to_dims[i].clone();
+                        }
+                        sum
+                    } else {
+                        TDim::Sym(scope.coord_sym(*k + k_to - 1))
+                    };
+                    map.insert(sym.clone(), new_expr);
+                }
+                return expr.substitute_all(&map).ok().map(|e| e.reduce());
+            }
+        }
+        // Pure merge: from = [d_0, …, d_{k-1}], to = [D].  We can express
+        // `pos[at+i]_old` from `pos[at]_new` only via integer division and
+        // modulo, which TDim doesn't carry.  Special-case the easy form
+        // where all but one of the merged dims is 1 — then the lone
+        // non-trivial sub-axis just maps to the new merged axis.
+        if to_dims.len() == 1 {
+            let to_dim = to_dims[0].clone();
+            let from_product: TDim = from_dims.iter().fold(TDim::Val(1), |acc, d| acc * d.clone());
+            if from_product == to_dim {
+                let k_from = from_dims.len();
+                let mut map: HashMap<Symbol, TDim> = HashMap::default();
+                for (k, sym) in &coord_syms {
+                    let scope = sym.scope()?;
+                    let new_expr = if *k < *at {
+                        TDim::Sym(sym.clone())
+                    } else if *k < *at + k_from {
+                        let i = *k - *at;
+                        let only_nontrivial =
+                            from_dims.iter().enumerate().all(|(j, d)| j == i || d.is_one());
+                        if only_nontrivial {
+                            TDim::Sym(scope.coord_sym(*at))
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        TDim::Sym(scope.coord_sym(*k - (k_from - 1)))
+                    };
+                    map.insert(sym.clone(), new_expr);
+                }
+                return expr.substitute_all(&map).ok().map(|e| e.reduce());
+            }
+        }
+        return None;
     }
 
     // For Add/Rm/Move: use transform_axis and substitute all at once to avoid
@@ -833,19 +906,19 @@ impl TypedOp for AxisOp {
         Ok(Some(op))
     }
 
-    fn concretize_dims(
+    fn substitute_symbols(
         &self,
         _source: &TypedModel,
         node: &TypedNode,
         target: &mut TypedModel,
         mapping: &HashMap<OutletId, OutletId>,
-        values: &SymbolValues,
+        subs: &HashMap<Symbol, TDim>,
     ) -> TractResult<TVec<OutletId>> {
         let op = if let AxisOp::Reshape(axis, from, to) = self {
             AxisOp::Reshape(
                 *axis,
-                from.iter().map(|d| d.eval(values)).collect(),
-                to.iter().map(|d| d.eval(values)).collect(),
+                from.iter().map(|d| d.substitute_all(subs)).collect::<TractResult<_>>()?,
+                to.iter().map(|d| d.substitute_all(subs)).collect::<TractResult<_>>()?,
             )
         } else {
             self.clone()
@@ -879,9 +952,7 @@ impl TypedOp for AxisOp {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
-        if node.outputs[0].fact.exotic_fact.is_some() {
-            return Ok(None);
-        }
+        rule_if!(node.outputs[0].fact.exotic_fact.is_none());
         if let Some(shape) = node.outputs[0].fact.shape.as_concrete()
             && !matches!(self, AxisOp::Move(_, _))
         {
@@ -964,47 +1035,32 @@ pub fn perm_to_ops(input: &[usize]) -> TVec<AxisOp> {
 
 pub fn compute_shape_with_tf_rules(input: &[TDim], shape_spec: &[TDim]) -> TractResult<TVec<TDim>> {
     let mut shape: TVec<TDim> = shape_spec.into();
-    fn deal_with_zero<'a>(
-        mut input_dims: std::iter::Peekable<impl Iterator<Item = &'a TDim>>,
-        shape: &mut [TDim],
-    ) -> TractResult<()> {
-        let mut remaining_dim_input = 1.to_dim();
-        for slot in shape.iter_mut() {
-            if *slot == (-1).into() {
-                break;
-            }
-            if *slot == 0.into() {
-                if remaining_dim_input != TDim::one() {
-                    bail!("Invalid remaining dim");
-                }
-                *slot = (*input_dims.peek().context("Invalid")?).clone();
-            }
-            loop {
-                let quotient = remaining_dim_input.maybe_div(slot);
-                if quotient.is_err() || quotient.as_ref().unwrap().1 != 1 {
-                    remaining_dim_input *= input_dims.next().context("Invalid")?;
-                } else {
-                    break;
-                }
-            }
-            remaining_dim_input = remaining_dim_input.maybe_div(slot)?.0;
+    // Replace 0s with corresponding input dims (positional, per ONNX/TF spec)
+    for (i, s) in shape.iter_mut().enumerate() {
+        if *s == 0.into() {
+            *s = input
+                .get(i)
+                .with_context(|| {
+                    format!("Reshape: 0 at position {i} but input only has {} dims", input.len())
+                })?
+                .clone();
         }
-        Ok(())
     }
-
-    deal_with_zero(input.iter().peekable(), &mut shape)?;
-    shape.reverse();
-    deal_with_zero(input.iter().rev().peekable(), &mut shape)?;
-    shape.reverse();
-
+    let input_vol: TDim = input.iter().product();
     if let Some(pos) = shape.iter().position(|d| *d == (-1).into()) {
-        let input_vol: TDim = input.iter().product();
         let shape_vol: TDim = shape.iter().filter(|d| **d != (-1).into()).product();
         let div = input_vol.maybe_div(&shape_vol)?;
         if div.1 != 1 {
             bail!("invalid")
         }
         shape[pos] = div.0;
+    } else {
+        let shape_vol: TDim = shape.iter().product();
+        if input_vol != shape_vol {
+            bail!(
+                "Reshape volume mismatch: input {input:?} (vol={input_vol}) vs shape {shape:?} (vol={shape_vol})"
+            );
+        }
     }
     Ok(shape)
 }
@@ -1046,7 +1102,9 @@ pub fn to_axis_ops_with_tf_rules(
                         }
                     }
                 }
-                todo!()
+                bail!(
+                    "Could not find matching reshape grouping: current_input={current_input:?} final_output={final_output:?} common={common}"
+                )
             }
         } else if final_output.len() > current_input.len() {
             stack.push(AxisOp::Add(current_input.len()));
@@ -1625,6 +1683,15 @@ mod proptests {
         assert_eq!(
             &*compute_shape_with_tf_rules(s![s, b, 2, 128], s!(0, 0, -1)).unwrap(),
             s![s, b, 256]
+        )
+    }
+
+    #[test]
+    fn compute_zero_with_rank_change() {
+        // Moonshine RoPE: input rank 4, output rank 5, two leading 0s
+        assert_eq!(
+            &*compute_shape_with_tf_rules(s![1, 52, 8, 32], s!(0, 0, 8, 16, 2)).unwrap(),
+            s![1, 52, 8, 16, 2]
         )
     }
 

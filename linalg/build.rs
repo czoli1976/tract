@@ -15,6 +15,101 @@ fn include_amx() -> bool {
         || (env::var("CARGO_FEATURE_APPLE_AMX_IOS").is_ok() && os == "ios" && arch == "aarch64")
 }
 
+fn include_sme() -> bool {
+    let arch = var("CARGO_CFG_TARGET_ARCH");
+    let os = var("CARGO_CFG_TARGET_OS");
+    arch == "aarch64" && (os == "macos" || os == "linux")
+}
+
+// Probe whether the target assembler can actually assemble SME instructions.
+// Old binutils (e.g. the Debian stretch aarch64 cross-toolchain used in CI)
+// predate SME and reject the mnemonics even with `.arch armv9-a+sme2`, which
+// breaks the build. When the probe fails we skip the SME kernels entirely;
+// the matching `tract_sme` cfg keeps the Rust side from referencing the
+// (now absent) kernel symbols, and dispatch falls back to the portable path.
+fn assembler_supports_sme() -> bool {
+    cc::Build::new()
+        .file("arm64/sme/dummy_sme.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_sme_probe")
+        .is_ok()
+}
+
+// Probe whether the target assembler can actually assemble Intel AMX int8
+// instructions (`ldtilecfg`, `tilezero`, `tdpbusd`, `tilerelease`). Older
+// binutils (e.g. Debian stretch's gas 2.28) predate AMX and reject these
+// mnemonics outright, which would break the x86_64 build for users on those
+// toolchains. When the probe fails we skip the AMX kernel entirely; the
+// matching `tract_amx_int8` cfg keeps the Rust side from referencing the
+// (absent) kernel symbol, and `qmmm_i32` dispatch falls back to VNNI (or
+// AVX2 when VNNI is itself unavailable).
+fn assembler_supports_amx_int8() -> bool {
+    cc::Build::new()
+        .file("x86_64/avx512amx/dummy.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_amx_int8_probe")
+        .is_ok()
+}
+
+// Probe whether the assembler accepts the `{vex}` prefix on VPDPBUSD --
+// needed to force the AVX-VNNI (VEX) form instead of the AVX-512-VNNI
+// (EVEX) form gas defaults to. `{vex}` / `{evex}` instruction prefixes
+// were added in binutils 2.36; older toolchains reject them. When the
+// probe fails the avxvnni_mmm_i32_8x8 kernel is skipped and dispatch
+// falls back to the AVX2 emulation kernel on AVX-VNNI-only hardware.
+fn assembler_supports_avxvnni() -> bool {
+    cc::Build::new()
+        .file("x86_64/avx512amx/dummy_avxvnni.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_avxvnni_probe")
+        .is_ok()
+}
+
+// Probe whether the target assembler can assemble AMX bf16 instructions
+// (`tdpbf16ps`). Both int8 and bf16 AMX mnemonics require binutils >= 2.34,
+// so in practice this probe succeeds whenever `assembler_supports_amx_int8`
+// does. Provided separately so the two cfgs are independently controlled
+// and users on exotic toolchains can opt-out of just the bf16 kernel.
+fn assembler_supports_amx_bf16() -> bool {
+    cc::Build::new()
+        .file("x86_64/avx512amx/dummy_bf16.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_amx_bf16_probe")
+        .is_ok()
+}
+
+fn include_sve() -> bool {
+    // SVE/SVE2 lives on ARMv9 server/mobile cores (Neoverse V1+/N2+, Cortex-X2+,
+    // Graviton 3/4) — Linux aarch64. No Apple silicon has SVE.
+    var("CARGO_CFG_TARGET_ARCH") == "aarch64" && var("CARGO_CFG_TARGET_OS") == "linux"
+}
+
+// Probe whether the C compiler supports SVE intrinsics (arm_sve.h + `+sve`).
+// Old toolchains (e.g. the Debian stretch cross-gcc) lack them; when the probe
+// fails we skip the SVE kernels and the `tract_sve` cfg, so the Rust side never
+// references the (absent) symbols and dispatch falls back to NEON.
+fn compiler_supports_sve() -> bool {
+    let out_dir = path::PathBuf::from(var("OUT_DIR"));
+    let probe = out_dir.join("sve_probe.c");
+    fs::write(&probe, "#include <arm_sve.h>\nint p(void){ return (int)svcntw(); }\n").unwrap();
+    cc::Build::new()
+        .file(&probe)
+        .flag("-march=armv8.2-a+sve")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_sve_probe")
+        .is_ok()
+}
+
 fn jump_table() -> Vec<String> {
     println!("cargo:rerun-if-changed=src/frame/mmm/fuse.rs");
     std::fs::read_to_string("src/frame/mmm/fuse.rs")
@@ -79,10 +174,72 @@ fn main() {
     let suffix = env!("CARGO_PKG_VERSION").replace(['-', '.'], "_");
     make_extern_kernel_decl_macro(&out_dir, &suffix);
 
+    // `tract_sme` is set below only when both include_sme() and the assembler
+    // SME probe succeed; declare it so rustc's unexpected-cfg lint stays quiet.
+    println!("cargo:rustc-check-cfg=cfg(tract_sme)");
+    // Set below only when include_sve() and the SVE compiler probe both pass.
+    println!("cargo:rustc-check-cfg=cfg(tract_sve)");
+    // Set below only when the x86_64 assembler accepts AMX int8 mnemonics
+    // (avoids breaking the build on toolchains predating AMX).
+    println!("cargo:rustc-check-cfg=cfg(tract_amx_int8)");
+    // Set below only when the assembler accepts AMX bf16 mnemonics (tdpbf16ps).
+    println!("cargo:rustc-check-cfg=cfg(tract_amx_bf16)");
+    // Set below only when the assembler accepts the `{vex}` prefix on
+    // VPDPBUSD (binutils >= 2.36) -- needed for the AVX-VNNI ymm kernel.
+    println!("cargo:rustc-check-cfg=cfg(tract_avxvnni)");
+
     match arch.as_ref() {
         "x86_64" => {
             let mut files = preprocess_files("x86_64/fma", &[], &suffix, false);
             files.extend(preprocess_files("x86_64/avx512", &[], &suffix, false));
+
+            // Pull the AMX kernel templates out of the generic fma bulk-compile
+            // so they can be gated behind assembler probes below. All AMX
+            // mnemonics require gas >= 2.34; old toolchains (Debian stretch's
+            // binutils 2.28) would otherwise fail the whole build.
+            //
+            // Split by accumulator type:
+            //   avx512amx_*_i32_* → tdpbssd   → gated on tract_amx_int8
+            //   avx512amx_*_f32_* → tdpbf16ps → gated on tract_amx_bf16
+            let amx_int8_files: Vec<path::PathBuf> = files
+                .iter()
+                .filter(|f| {
+                    f.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("avx512amx_") && n.contains("_i32_"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            let amx_bf16_files: Vec<path::PathBuf> = files
+                .iter()
+                .filter(|f| {
+                    f.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("avx512amx_") && n.contains("_f32_"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            // AVX-VNNI ymm kernel: gas requires the `{vex}` instruction prefix
+            // (binutils 2.36+) -- pulled aside so the bulk -mfma compile, which
+            // is fine on older binutils, isn't broken when the AVX-VNNI cfg is
+            // disabled.
+            let avxvnni_files: Vec<path::PathBuf> = files
+                .iter()
+                .filter(|f| {
+                    f.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("avxvnni_"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            files.retain(|f| {
+                !amx_int8_files.contains(f)
+                    && !amx_bf16_files.contains(f)
+                    && !avxvnni_files.contains(f)
+            });
 
             if os == "windows" {
                 if use_masm() {
@@ -132,6 +289,53 @@ fn main() {
             } else {
                 cc::Build::new().files(files).flag("-mfma").compile("x86_64_fma");
             }
+
+            // AMX int8 kernel: compile only when the assembler accepts the
+            // mnemonics, and the kernel template was actually pulled aside
+            // above. Unix only for now (the .S uses the GAS intel-syntax
+            // path). The `tract_amx_int8` cfg gates the Rust-side symbol
+            // reference: when the probe fails on old toolchains (e.g. Debian
+            // stretch's binutils 2.28), the kernel is omitted and `qmmm_i32`
+            // dispatch falls back to VNNI or AVX2 with no build error.
+            if os != "windows"
+                && !amx_int8_files.is_empty()
+                && assembler_supports_amx_int8()
+            {
+                cc::Build::new()
+                    .files(&amx_int8_files)
+                    .compile("x86_64_avx512amx");
+                println!("cargo:rustc-cfg=tract_amx_int8");
+            }
+
+            // AMX bf16 kernel for f32 matmul (tdpbf16ps). Same toolchain
+            // requirement and Unix-only constraint as the int8 path. When the
+            // probe fails, the `tract_amx_bf16` cfg stays unset and
+            // `plug_avx512amx_bf16` is compiled out — `mmm_f32` then falls
+            // back to AVX-512 / FMA without any build error.
+            if os != "windows"
+                && !amx_bf16_files.is_empty()
+                && assembler_supports_amx_bf16()
+            {
+                cc::Build::new()
+                    .files(&amx_bf16_files)
+                    .compile("x86_64_avx512amx_bf16");
+                println!("cargo:rustc-cfg=tract_amx_bf16");
+            }
+
+            // AVX-VNNI ymm int8 kernel. Independent of the AMX gates: this
+            // kernel ships VPDPBUSD-accelerated i8 GEMM to Atom-class cores
+            // (Alder Lake-E, Sierra Forest, Clearwater Forest / Darkmont)
+            // that have AVX-VNNI but no AVX-512, falling back to AVX2
+            // emulation when the runtime CPUID detection misses.
+            if os != "windows"
+                && !avxvnni_files.is_empty()
+                && assembler_supports_avxvnni()
+            {
+                cc::Build::new()
+                    .files(&avxvnni_files)
+                    .compile("x86_64_avxvnni");
+                println!("cargo:rustc-cfg=tract_avxvnni");
+            }
         }
         "arm" | "armv7" => {
             let files = preprocess_files("arm32/armvfpv2", &[], &suffix, false);
@@ -155,6 +359,30 @@ fn main() {
             if include_amx() {
                 let files = preprocess_files("arm64/apple_amx", &[], &suffix, false);
                 cc::Build::new().files(files).compile("appleamx");
+            }
+            if include_sme() && assembler_supports_sme() {
+                let files = preprocess_files("arm64/sme", &[], &suffix, false);
+                cc::Build::new().files(files).compile("sme");
+                println!("cargo:rustc-cfg=tract_sme");
+            }
+            if include_sve() && compiler_supports_sve() {
+                // VLA SVE kernels (C intrinsics, fixed symbols — not suffix-templated).
+                cc::Build::new()
+                    .file("arm64/sve/sve_mmm_f32.c")
+                    .file("arm64/sve/sve_mmv_f32_64x1.c")
+                    .file("arm64/sve/sve_mmm_i32.c")
+                    .file("arm64/sve/sve_mmm_i32_64x1.c")
+                    .flag("-march=armv8.2-a+sve")
+                    .compile("tract_sve_kernels");
+                // f16 kernels need native FP16 arithmetic (+fp16); compiled
+                // separately so the +sve-only kernels above never gain fp16
+                // codegen. Runtime-gated on has_fp16() as well as SVE2.
+                cc::Build::new()
+                    .file("arm64/sve/sve_mmm_f16.c")
+                    .file("arm64/sve/sve_mmv_f16_64x1.c")
+                    .flag("-march=armv8.2-a+sve+fp16")
+                    .compile("tract_sve_f16_kernels");
+                println!("cargo:rustc-cfg=tract_sve");
             }
             if std::env::var("CARGO_FEATURE_NO_FP16").is_err() {
                 let config =

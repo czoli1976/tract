@@ -84,6 +84,18 @@ name = "mm_for_asr_am"
 harness = false
 
 [[bench]]
+name = "hardswish"
+harness = false
+
+[[bench]]
+name = "silu"
+harness = false
+
+[[bench]]
+name = "gelu"
+harness = false
+
+[[bench]]
 name = "sigmoid"
 harness = false
 
@@ -118,4 +130,28 @@ harness = false
 [[bench]]
 bench = false
 name = "leaky_relu"
+harness = false
+
+[[bench]]
+name = "avx512_zombies"
+harness = false
+
+[[bench]]
+name = "wasm"
+harness = false
+
+[[bench]]
+name = "vnni_i32"
+harness = false
+
+[[bench]]
+name = "amx_i32"
+harness = false
+
+[[bench]]
+name = "amx_f32"
+harness = false
+
+[[bench]]
+name = "avxvnni_i32"
 harness = false

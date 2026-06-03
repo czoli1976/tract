@@ -30,7 +30,13 @@ impl std::error::Error for TooEarly {}
 
 macro_rules! b( ($e:expr) => { Box::new($e) } );
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+// `Hash` stays structural while `PartialEq` accepts an algebraic second chance:
+// see the `PartialEq` impl below for the rationale (the simplifier's internal
+// `HashMap<TDim, _>` only ever compares within same-canonical-form buckets, so
+// the standard `a == b => hash(a) == hash(b)` contract being violated outside
+// that path is acceptable here).
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Clone, Eq, Hash, Debug)]
 pub enum TDim {
     Val(i64),
     Sym(Symbol),
@@ -48,6 +54,72 @@ pub enum TDim {
 }
 
 use TDim::*;
+
+/// Structural equality on the TDim tree — what `#[derive(PartialEq)]` would
+/// produce.  Used as the fast-path inside `PartialEq` (and by the simplifier's
+/// internal `HashMap<TDim, _>`, which compares within same-hash buckets where
+/// structural equality is the only thing that matters).
+fn eq_structural(a: &TDim, b: &TDim) -> bool {
+    match (a, b) {
+        (Val(x), Val(y)) => x == y,
+        (Sym(x), Sym(y)) => x == y,
+        (Add(x), Add(y))
+        | (Mul(x), Mul(y))
+        | (Broadcast(x), Broadcast(y))
+        | (Min(x), Min(y))
+        | (Max(x), Max(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| eq_structural(a, b))
+        }
+        (MulInt(p, x), MulInt(q, y)) => p == q && eq_structural(x, y),
+        (Div(x, p), Div(y, q)) => p == q && eq_structural(x, y),
+        (Ge(a, b), Ge(c, d)) | (Eq(a, b), Eq(c, d)) => eq_structural(a, c) && eq_structural(b, d),
+        _ => false,
+    }
+}
+
+// Thread-local guard: while simplifying the difference inside `eq`, fall back
+// to the structural-only path for any nested `==` calls.  Without this guard
+// the simplifier's internal `HashMap<TDim, i64>` would re-enter `eq` from
+// inside `(self - other).simplify()`, recursing without bound on
+// non-structurally-equal inputs.
+std::thread_local! {
+    static EQ_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl PartialEq for TDim {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: structural tree equality.
+        if eq_structural(self, other) {
+            return true;
+        }
+        // Inside an enclosing simplification triggered by a previous
+        // second-chance call, fall back to structural equality only.
+        if EQ_GUARD.with(|g| g.get()) {
+            return false;
+        }
+        // Skip second-chance when either side is a leaf (`Val` or `Sym`).
+        // For `Val(c)` vs anything non-`Val`: if they were semantically
+        // equal, the simplifier should already have folded the other side
+        // to `Val(c)`; running a diff-and-simplify here just risks
+        // arithmetic overflow on extreme constants (e.g. the simplifier
+        // filters against `Val(i64::MAX)`/`Val(i64::MIN)` sentinels).
+        // For `Sym(x)` leaves, assertion-driven equality belongs in
+        // `simplify`, not in `eq`.
+        if matches!(self, Val(_) | Sym(_)) || matches!(other, Val(_) | Sym(_)) {
+            return false;
+        }
+        // Second chance: prove the difference simplifies to zero.  Two
+        // algebraically equal TDims often arrive at different canonical
+        // forms via different construction paths (e.g. `1 + (7S+3)/4` and
+        // `((S+1)*7)/4` after blockify substitutes T → k·S in encoder
+        // shapes).  Subtracting and simplifying lets the existing
+        // simplifier rules cancel them out.
+        EQ_GUARD.with(|g| g.set(true));
+        let diff = (self.clone() - other.clone()).simplify();
+        EQ_GUARD.with(|g| g.set(false));
+        matches!(diff, Val(0))
+    }
+}
 
 fn tdim_lexi_order(a: &TDim, b: &TDim) -> Ordering {
     match (a, b) {
@@ -88,6 +160,59 @@ fn tdim_lexi_order(a: &TDim, b: &TDim) -> Ordering {
     }
 }
 
+/// `Div(Add(terms), q)` — try to extract every `MulInt(c, X)` where `c % q == 0`
+/// out of the Div, leaving only a constant remainder in `[0, q)`.
+///
+/// Returns `Some(simplified)` when the residual constant is in `[0, q)` and
+/// every extracted symbolic factor `X` is provably non-negative — both
+/// conditions are required for soundness under tract's truncating
+/// division (`Rust i64 /`):
+///
+/// * the constant being in `[0, q)` makes `c/q_trunc = 0`;
+/// * `X ≥ 0` makes the identity `(k·X + c)/k_trunc = X` hold (it fails
+///   at e.g. `X = -1, k = 2, c = 0` because truncation rounds toward zero).
+///
+/// The `Val` arm above already handles constants outside `[0, q)`, so by
+/// the time we get here `terms` contains at most one `Val` and any number
+/// of `MulInt(c, X)` / other shapes.
+fn try_divide_multiple_plus_remainder(
+    terms: &[TDim],
+    q: u64,
+    scope: &SymbolScopeData,
+    extra: &[Assertion],
+) -> Option<TDim> {
+    let mut quotients: Vec<TDim> = vec![];
+    let mut const_rem: i64 = 0;
+    let mut any_extracted = false;
+    for term in terms {
+        match term {
+            MulInt(c, x) if *c != 0 && c.rem_euclid(q as i64) == 0 => {
+                if !scope.prove_positive_or_zero_with_extra(x, extra) {
+                    return None;
+                }
+                let new_coeff = c / (q as i64);
+                quotients.push(if new_coeff == 1 {
+                    (**x).clone()
+                } else if new_coeff == -1 {
+                    MulInt(-1, x.clone())
+                } else {
+                    MulInt(new_coeff, x.clone())
+                });
+                any_extracted = true;
+            }
+            Val(v) => const_rem += v,
+            _ => return None,
+        }
+    }
+    if !any_extracted {
+        return None;
+    }
+    if !(0..q as i64).contains(&const_rem) {
+        return None;
+    }
+    Some(if quotients.len() == 1 { quotients.remove(0) } else { Add(quotients) })
+}
+
 impl fmt::Display for TDim {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match &self {
@@ -95,7 +220,9 @@ impl fmt::Display for TDim {
             Val(it) => write!(fmt, "{it}"),
             Add(it) => write!(fmt, "{}", it.iter().map(|x| format!("{x}")).join("+")),
             Mul(it) => write!(fmt, "{}", it.iter().map(|x| format!("({x})")).join("*")),
-            Broadcast(it) => write!(fmt, "{}", it.iter().map(|x| format!("({x})")).join("#")),
+            Broadcast(it) => {
+                write!(fmt, "broadcast({})", it.iter().map(|x| format!("({x})")).join(", "))
+            }
             Min(it) => write!(fmt, "min({})", it.iter().map(|x| format!("{x}")).join(",")),
             Max(it) => write!(fmt, "max({})", it.iter().map(|x| format!("{x}")).join(",")),
             MulInt(a, b) => write!(fmt, "{a}*{b}"),
@@ -326,11 +453,24 @@ impl TDim {
                     if let Add(terms) = &num {
                         let (integer, non_integer): (Vec<_>, Vec<_>) =
                             terms.iter().cloned().partition(|a| a.gcd() % q == 0);
-                        let mut new_terms = integer.iter().map(|i| i.div(*q)).collect::<Vec<_>>();
-                        if non_integer.len() > 0 {
-                            new_terms.push(Div(b!(Add(non_integer)), *q));
+                        // Skip when the non-integer bucket holds a constant:
+                        // under tract's truncating `/`, splitting (k·X+c)/k →
+                        // X + c/k is unsound for negative X (X=-1, k=2, c=1:
+                        // (-1)/2 = 0 ≠ X). The sound version, gated on
+                        // prove_positive_or_zero, lives in simplify_rec::Div
+                        // via try_divide_multiple_plus_remainder. Cases where
+                        // the remainder is purely symbolic (e.g. A%2 → /2
+                        // lowers to (A − 2·(A/2))/2, non_integer=[A]) stay
+                        // here: the emitted Div(non_integer, q) cancels with
+                        // the extracted quotient and reduces to zero.
+                        if !non_integer.iter().any(|t| matches!(t, Val(_))) {
+                            let mut new_terms =
+                                integer.iter().map(|i| i.div(*q)).collect::<Vec<_>>();
+                            if non_integer.len() > 0 {
+                                new_terms.push(Div(b!(Add(non_integer)), *q));
+                            }
+                            forms.push(Add(new_terms))
                         }
-                        forms.push(Add(new_terms))
                     }
                     forms.push(Div(b!(num), *q))
                 }
@@ -353,6 +493,58 @@ impl TDim {
 
     pub fn find_scope(&self) -> Option<SymbolScope> {
         Self::find_any_sym(self).and_then(|s| s.scope().clone())
+    }
+
+    /// Fully distribute every `Mul` of `Add`s in `self` into a flat sum of
+    /// products, then `simplify`.  Used to compare two algebraically equal
+    /// but differently-factored TDims for equality (e.g. Reshape volume
+    /// checks on graphs where the same dimension is built two ways).
+    ///
+    /// Cost can blow up combinatorially on very deeply factored expressions
+    /// — call this only at boundaries where structural equality is needed,
+    /// not as a general-purpose simplifier.
+    pub fn expand_polynomial(self) -> TDim {
+        use self::TDim::*;
+        match self {
+            Mul(terms) => {
+                let terms: Vec<TDim> = terms.into_iter().map(Self::expand_polynomial).collect();
+                if let Some(add_idx) = terms.iter().position(|t| matches!(t, Add(_))) {
+                    let Add(add_terms) = terms[add_idx].clone() else { unreachable!() };
+                    let others: Vec<TDim> = terms
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != add_idx)
+                        .map(|(_, t)| t.clone())
+                        .collect();
+                    Add(add_terms
+                        .into_iter()
+                        .map(|t| {
+                            let mut product = others.clone();
+                            product.push(t);
+                            Mul(product).expand_polynomial()
+                        })
+                        .collect())
+                    .simplify()
+                } else {
+                    Mul(terms).simplify()
+                }
+            }
+            MulInt(c, inner) => MulInt(c, Box::new(inner.expand_polynomial())).simplify(),
+            Add(terms) => Add(terms.into_iter().map(Self::expand_polynomial).collect()).simplify(),
+            Div(a, q) => Div(Box::new(a.expand_polynomial()), q).simplify(),
+            Min(terms) => Min(terms.into_iter().map(Self::expand_polynomial).collect()).simplify(),
+            Max(terms) => Max(terms.into_iter().map(Self::expand_polynomial).collect()).simplify(),
+            Broadcast(terms) => {
+                Broadcast(terms.into_iter().map(Self::expand_polynomial).collect()).simplify()
+            }
+            Ge(a, b) => {
+                Ge(Box::new(a.expand_polynomial()), Box::new(b.expand_polynomial())).simplify()
+            }
+            Eq(a, b) => {
+                Eq(Box::new(a.expand_polynomial()), Box::new(b.expand_polynomial())).simplify()
+            }
+            it @ (Sym(_) | Val(_)) => it,
+        }
     }
 
     pub fn simplify(self) -> TDim {
@@ -442,16 +634,56 @@ impl TDim {
                     }
                 }
 
+                // Pull the integer GCD of all term coefficients out as a
+                // common factor: e.g. Add([Val(6), MulInt(14, S)]) becomes
+                // MulInt(2, Add([Val(3), MulInt(7, S)])).  The downstream
+                // Div(MulInt(p, a), q) arm then cancels (p, q) gcd, so
+                // (6 + 14·S) / 8 reduces to (3 + 7·S) / 4 with no special
+                // Div-over-Add rule needed.
+                //
+                // Only consider entries with non-zero counts — zero-count
+                // entries (canceled-out factors) get filtered later, but
+                // would otherwise drag the gcd to spurious values.  Only
+                // factor when at least one surviving entry has a
+                // non-constant key, otherwise the Add reduces to a single
+                // `Val` and wrapping it in `MulInt(g, Val(c/g))` is a
+                // strict regression in canonical form.
+                let has_non_const =
+                    simplified_terms.iter().any(|(k, &c)| c != 0 && !matches!(k, Val(_)));
+                let coef_gcd = if has_non_const {
+                    simplified_terms
+                        .values()
+                        .filter(|&&c| c != 0)
+                        .map(|c| c.unsigned_abs() as i64)
+                        .reduce(|a, b| a.gcd(&b))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let outer_factor = if coef_gcd > 1 {
+                    for v in simplified_terms.values_mut() {
+                        *v /= coef_gcd;
+                    }
+                    Some(coef_gcd)
+                } else {
+                    None
+                };
+
                 let mut members: Vec<TDim> = simplified_terms
                     .into_iter()
                     .filter_map(|(term, count)| evaluate_count(term, count))
                     .collect();
                 members.sort_by(tdim_lexi_order);
 
-                match members.len() {
+                let inner = match members.len() {
                     0 => TDim::Val(0),
                     1 => members.into_iter().next().unwrap(),
                     _ => TDim::Add(members),
+                };
+                match outer_factor {
+                    None => inner,
+                    Some(_) if matches!(inner, TDim::Val(0)) => TDim::Val(0),
+                    Some(g) => TDim::MulInt(g, Box::new(inner)),
                 }
             }
             Mul(terms) => {
@@ -459,6 +691,14 @@ impl TDim {
                 // expand Mul([a, Add([b, c])]) => Add([Mul([a, b]), Mul([a, c])]).
                 // This lets (T+1)*P simplify to T*P + P, which is needed for
                 // cancellation in expressions like (T+1)*P - T*P.
+                //
+                // Multi-Add Muls are *not* eagerly expanded here — keeping them
+                // factored matters for `maybe_div`'s bag-of-factors path, which
+                // cancels common Add factors symbolically (e.g. dividing
+                // 16B·(1+Y)² by 8B·(1+Y) needs the (1+Y)s to be visible as
+                // factors, not melted into a polynomial sum).  Use
+                // `expand_polynomial` if you need a fully distributed canonical
+                // form for equality comparisons (see Reshape volume check).
                 {
                     let add_indices: Vec<usize> = terms
                         .iter()
@@ -598,22 +838,61 @@ impl TDim {
                                 q
                             )),
                         )
-                    } else if let Some(v) =
-                        terms.iter().find_map(|t| if let Val(v) = t { Some(*v) } else { None })
+                    } else if let Some(val) = terms
+                        .iter()
+                        .find_map(|t| if let Val(v) = t { Some(*v) } else { None })
+                        .and_then(|v| {
+                            if v >= q as i64 {
+                                Some(v / q as i64)
+                            } else if v < 0 {
+                                Some(-Integer::div_ceil(&-v, &(q as i64)))
+                            } else {
+                                None
+                            }
+                        })
                     {
-                        let offset = if v >= q as i64 {
-                            Some(v / q as i64)
-                        } else if v < 0 {
-                            Some(-Integer::div_ceil(&-v, &(q as i64)))
-                        } else {
-                            None
+                        terms.push(Val(-val * q as i64));
+                        // simplify_rec the inner Div too so that follow-up rules
+                        // (e.g. divide-multiple-plus-remainder below) can collapse
+                        // it once the Val extraction has tidied up the residual.
+                        let inner = Div(b!(Add(terms).simplify_rec(scope, scenario, extra)), q)
+                            .simplify_rec(scope, scenario, extra);
+                        Add(vec![Val(val), inner])
+                    } else if let Some(simplified) =
+                        try_divide_multiple_plus_remainder(&terms, q, scope, extra)
+                    {
+                        // Match `Div(Add([k·X, …, c]), k)` where:
+                        //   - one or more terms have a coefficient that is a multiple of q,
+                        //   - the rest sum to a constant in [0, q),
+                        //   - every extracted X is provably non-negative.
+                        // Then `(k·X + c)/k = X + 0 = X` under tract's truncating
+                        // division.  This is sound for X ≥ 0 only — at X = -1
+                        // the truncation rounds toward zero, not floor, breaking
+                        // the identity.  We use prove_positive_or_zero to gate.
+                        simplified.simplify_rec(scope, scenario, extra)
+                    } else if let Some(found_idx) = terms.iter().position(|term| {
+                        // Rule: (Y − q·(Y/q)) / q = 0  [i.e. (Y mod q) / q = 0]
+                        // Always sound: |Y mod q| < q so (Y mod q)/q = 0 under
+                        // truncating division regardless of sign of Y.
+                        matches!(term, MulInt(p, inner)
+                            if *p == -(q as i64)
+                            && matches!(inner.as_ref(), Div(_, q2) if *q2 == q))
+                    }) {
+                        let MulInt(_, inner) = &terms[found_idx] else { unreachable!() };
+                        let Div(y, _) = inner.as_ref() else { unreachable!() };
+                        let remaining: Vec<TDim> = terms
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| i != found_idx)
+                            .map(|(_, t)| t.clone())
+                            .collect();
+                        let remaining_sum = match remaining.len() {
+                            0 => Val(0),
+                            1 => remaining.into_iter().next().unwrap(),
+                            _ => Add(remaining),
                         };
-                        if let Some(val) = offset {
-                            terms.push(Val(-val * q as i64));
-                            Add(vec![
-                                Val(val),
-                                Div(b!(Add(terms).simplify_rec(scope, scenario, extra)), q),
-                            ])
+                        if eq_structural(&remaining_sum, y) {
+                            Val(0)
                         } else {
                             Div(b!(Add(terms)), q)
                         }
@@ -959,6 +1238,25 @@ impl TDim {
         self.clone().neg().prove_strict_positive()
     }
 
+    /// Least common multiple of two `TDim`s when both reduce to positive
+    /// integers.
+    ///
+    /// Returns `Val(0)` if either operand is `0`, and `None` if either is
+    /// symbolic, negative, or if the LCM would overflow `i64`. Callers
+    /// that need a safe answer for symbolic operands should fall back at
+    /// the call site.
+    pub fn lcm(&self, other: &TDim) -> Option<TDim> {
+        match (self.as_i64(), other.as_i64()) {
+            (Some(a), Some(b)) if a > 0 && b > 0 => {
+                let g = (a as u64).gcd(&(b as u64));
+                let l = (a as u64 / g).saturating_mul(b as u64);
+                if l > i64::MAX as u64 { None } else { Some(TDim::Val(l as i64)) }
+            }
+            (Some(0), _) | (_, Some(0)) => Some(TDim::Val(0)),
+            _ => None,
+        }
+    }
+
     pub fn gcd(&self) -> u64 {
         use self::TDim::*;
         match self {
@@ -1014,7 +1312,7 @@ impl TDim {
         TDim::Div(Box::new(Add(vec![self, Val(rhs as i64 - 1)])), rhs).reduce()
     }
 
-    pub(super) fn guess_slope(&self, sym: &Symbol) -> (i64, u64) {
+    pub fn guess_slope(&self, sym: &Symbol) -> (i64, u64) {
         fn slope_rec(d: &TDim, sym: &Symbol) -> (i64, i64) {
             match d {
                 Val(_) => (0, 1),
@@ -1381,6 +1679,16 @@ mod tests {
     }
 
     #[test]
+    fn lcm_basic() {
+        assert_eq!(Val(16).lcm(&Val(32)), Some(Val(32)));
+        assert_eq!(Val(32).lcm(&Val(16)), Some(Val(32)));
+        assert_eq!(Val(6).lcm(&Val(8)), Some(Val(24)));
+        assert_eq!(Val(7).lcm(&Val(7)), Some(Val(7)));
+        // Symbolic: not computable; callers fall back.
+        assert_eq!(Val(16).lcm(&A.to_dim()), None);
+    }
+
+    #[test]
     fn reduce_neg_mul() {
         assert_eq!(neg(&mul(2, &A.to_dim())).reduce(), mul(-2, &A.to_dim()))
     }
@@ -1503,6 +1811,59 @@ mod tests {
     }
 
     #[test]
+    fn divide_multiple_plus_remainder() {
+        // (k·X + r)/k → X under truncating division when 0 ≤ r < k AND X ≥ 0.
+        let scope = SymbolScope::default().with_assertion("S>=0").unwrap();
+        let s = scope.sym("S");
+
+        // (2S+1)/2 → S
+        let e: TDim = (s.to_dim() * 2 + 1) / 2;
+        assert_eq!(e.simplify(), s.to_dim());
+
+        // -1 + (2S+1)/2 → S - 1
+        let e: TDim = (s.to_dim() * 2 + 1) / 2 - 1;
+        assert_eq!(e.simplify(), s.to_dim() - 1);
+
+        // (2S-1)/2 → S - 1   (Val rule extracts -1 first, then our rule)
+        let e: TDim = (s.to_dim() * 2 - 1) / 2;
+        assert_eq!(e.simplify(), s.to_dim() - 1);
+
+        // (4S+3)/2 → 2S + 1   (Val rule extracts 1 = 3/2, then our rule on (4S+1)/2 → 2S)
+        let e: TDim = (s.to_dim() * 4 + 3) / 2;
+        assert_eq!(e.simplify(), s.to_dim() * 2 + 1);
+    }
+
+    #[test]
+    fn divide_multiple_plus_remainder_no_assertion() {
+        // Without an X≥0 assertion the (k·X+c)/k → X identity does NOT hold
+        // (X=-1, k=2, c=1 gives -1/2=0 ≠ X under truncating division). The
+        // wiggle Div arm used to emit that variant unconditionally; reduce()
+        // would then pick it on cost. Now wiggle skips the variant when the
+        // remainder bucket contains a Val, leaving only the sound rule
+        // gated on prove_positive_or_zero in simplify_rec.
+        let scope = SymbolScope::default();
+        let s = scope.sym("S");
+        let e: TDim = (s.to_dim() * 2 + 1) / 2;
+        assert_ne!(e.simplify(), s.to_dim());
+    }
+
+    #[test]
+    fn modulo_div_is_zero() {
+        // (Y − q·(Y/q)) / q = 0 for any Y and any q — the modulo remainder
+        // divided by the modulus is always zero under truncating division.
+        let scope = SymbolScope::default();
+        let s = scope.sym("S");
+        // Simple case: (S - 2*(S/2)) / 2 = (S mod 2) / 2 = 0
+        let e: TDim = (s.to_dim() - s.to_dim() / 2 * 2) / 2;
+        assert_eq!(e.simplify(), TDim::Val(0));
+        // Composite case: ((S+1) - 2*((S+1)/2)) / 2 = 0
+        // This is the exact pattern from SameUpper conv padding.
+        let a = s.to_dim() + 1;
+        let e2: TDim = (a.clone() - a.clone() / 2 * 2) / 2;
+        assert_eq!(e2.simplify(), TDim::Val(0));
+    }
+
+    #[test]
     fn reduce_div_bug_3() {
         let e1: TDim = (A.to_dim() / 2) * -4;
         let e2: TDim = (A.to_dim() / 2) * -4 / 1;
@@ -1513,6 +1874,19 @@ mod tests {
     fn reduce_mul_div() {
         let e: TDim = A.to_dim() * 2 / 2;
         assert_eq!(e, A.to_dim());
+    }
+
+    #[test]
+    fn expand_polynomial_two_add_factors() {
+        // (a + 2*a*b) * (1 + b)  ==poly==  a * (1 + b) * (1 + 2*b)
+        // Both fully expand to a + 3*a*b + 2*a*b*b.  We don't auto-expand in
+        // simplify (it would block maybe_div on factored-form denominators),
+        // but expand_polynomial does, and Reshape uses it for volume checks.
+        let a = A.to_dim();
+        let b = B.to_dim();
+        let lhs = (a.clone() + a.clone() * &b * 2) * (TDim::from(1) + &b);
+        let rhs = a.clone() * (TDim::from(1) + &b) * (TDim::from(1) + b.clone() * 2);
+        assert_eq!(lhs.expand_polynomial(), rhs.expand_polynomial());
     }
 
     #[test]
@@ -1900,5 +2274,52 @@ mod tests {
         let a_s = a.simplify();
         let c_s = c.simplify();
         assert_eq!(a_s, c_s, "8*(-1*B) should simplify the same as -8*B");
+    }
+
+    /// Encoder-pulse case: (6 + 14·S) / 8 == (3 + 7·S) / 4.
+    /// Both Add terms (Val(6) and MulInt(14, S)) share factor 2 with
+    /// divisor 8, so the simplifier should reduce both sides by 2.
+    #[test]
+    fn reduce_div_by_common_factor_with_divisor() {
+        let lhs = (A.to_dim() * 14 + 6) / 8;
+        let rhs = (A.to_dim() * 7 + 3) / 4;
+        assert_eq!(lhs, rhs);
+    }
+
+    /// Common factor that fully divides the divisor → drop the divisor.
+    /// (4·a + 8) / 4  ==  a + 2.
+    #[test]
+    fn reduce_div_when_factor_equals_divisor() {
+        let lhs = (A.to_dim() * 4 + 8) / 4;
+        let rhs = A.to_dim() + 2;
+        assert_eq!(lhs, rhs);
+    }
+
+    /// No common factor → no reduction (identity check).
+    /// (3 + 7·a) / 4 stays as-is (gcd(3, 7, 4) = 1).
+    #[test]
+    fn no_reduce_when_terms_coprime_with_divisor() {
+        let e = (A.to_dim() * 7 + 3) / 4;
+        // We just check it didn't reduce to something weird; the
+        // canonical form is `Div(Add(...), 4)`.
+        match &e {
+            Div(_, q) => assert_eq!(*q, 4),
+            other => panic!("expected Div(_, 4), got {other:?}"),
+        }
+    }
+
+    /// Sym without an explicit `MulInt` wrapper has implicit coefficient
+    /// 1.  Any common factor gcd including 1 collapses to 1, so the
+    /// reduction does nothing — the rule must not silently drop the Sym.
+    #[test]
+    fn no_reduce_when_sym_has_implicit_unit_coefficient() {
+        // (a + 4) / 2 must stay non-trivial — gcd(1, 4, 2) = 1.
+        let e = (A.to_dim() + 4) / 2;
+        // It can simplify to other forms but it should still depend on `a`.
+        // Eval at a=2 → (2+4)/2 = 3.  Eval at a=4 → (4+4)/2 = 4.
+        let sv2 = SymbolValues::default().with(&A, 2);
+        let sv4 = SymbolValues::default().with(&A, 4);
+        assert_eq!(e.eval_to_i64(&sv2).unwrap(), 3);
+        assert_eq!(e.eval_to_i64(&sv4).unwrap(), 4);
     }
 }

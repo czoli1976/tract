@@ -7,8 +7,6 @@ use crate::tract_data::itertools::Itertools;
 
 mod eval;
 
-#[cfg(feature = "blas")]
-pub mod as_blas;
 pub mod einsum_matmul;
 pub mod kernel_selection;
 pub mod prefix_matmul;
@@ -89,9 +87,8 @@ impl EinSum {
         let mut taps = tvec!();
         for (ix, input) in node.inputs.iter().enumerate() {
             let mut tap = patch.tap_model(model, *input)?;
-            if new_axis.inputs[ix].len() > 1 {
-                return Ok(None); // FIXME maybe
-            } else if new_axis.inputs[ix].is_empty() {
+            rule_if!(new_axis.inputs[ix].len() <= 1); // FIXME maybe
+            if new_axis.inputs[ix].is_empty() {
                 let insert_at = self.axes.rank(InOut::In(ix));
                 tap = patch.wire_node(
                     format!("{}.prop_axis.{}.input_{}", &node.name, new_axis.repr, ix),
@@ -223,7 +220,84 @@ impl TypedOp for EinSum {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TVec<Option<TDim>>>> {
-        crate::optim::propagate_roi::bubble_roi(model, node)
+        // First try bubble_roi: works for inputs that cover all ROI coord
+        // axes mentioned in the output ROI.  For inputs that DON'T cover
+        // every coord axis (= contracted/projected-out axes from this
+        // input's perspective), try the closed-form chunked-band recogniser
+        // which yields a constant band on the input's kept axis after
+        // existentially quantifying the projected axes.
+        let output_fact = model.outlet_fact(OutletId::new(node.id, 0))?;
+        let Some(roi) = &output_fact.region_of_interest else { return Ok(None) };
+        let input_facts: TVec<&TypedFact> =
+            node.inputs.iter().map(|i| model.outlet_fact(*i)).collect::<TractResult<_>>()?;
+        let output_facts = tvec![output_fact];
+        let inputs_ref: Vec<&TypedFact> = input_facts.iter().copied().collect();
+        let outputs_ref: Vec<&TypedFact> = output_facts.iter().copied().collect();
+        let mapping = self.axes_mapping(&inputs_ref, &outputs_ref)?;
+        let roi_coord_axes: Vec<(usize, Symbol)> = roi
+            .symbols()
+            .into_iter()
+            .filter_map(|s| crate::ops::logic::sym_to_coord_axis(&s).map(|k| (k, s)))
+            .collect();
+
+        let project_for_input = |input_ix: usize| -> Option<TDim> {
+            // Classify each output ROI coord axis: projected (no input axis)
+            // or preserved (maps to input).
+            let mut projected: Vec<Symbol> = vec![];
+            let mut preserved: Vec<(Symbol, usize)> = vec![];
+            for (out_pos, sym) in &roi_coord_axes {
+                let logical = mapping
+                    .iter_all_axes()
+                    .find(|a| a.outputs.first().is_some_and(|o| o.contains(out_pos)))?;
+                match logical.inputs[input_ix].first() {
+                    None => projected.push(sym.clone()),
+                    Some(&in_pos) => {
+                        if input_facts[input_ix].shape[in_pos] != output_fact.shape[*out_pos] {
+                            return None;
+                        }
+                        preserved.push((sym.clone(), in_pos));
+                    }
+                }
+            }
+            if projected.is_empty() {
+                // All axes preserved — fall through to standard remap.
+                let mut sub_map: HashMap<Symbol, TDim> = HashMap::new();
+                for (sym, in_pos) in &preserved {
+                    if crate::ops::logic::sym_to_coord_axis(sym) != Some(*in_pos) {
+                        let scope = sym.scope()?;
+                        sub_map.insert(sym.clone(), TDim::Sym(scope.coord_sym(*in_pos)));
+                    }
+                }
+                return if sub_map.is_empty() {
+                    Some(roi.clone())
+                } else {
+                    roi.substitute_all(&sub_map).ok()
+                };
+            }
+            // Try the chunked-band recogniser: one projected axis × one
+            // preserved axis at a time.
+            for p_sym in &projected {
+                for (k_sym, k_in_pos) in &preserved {
+                    if let Some(band) = crate::optim::propagate_roi::recognise_chunked_band_project(
+                        roi, p_sym, k_sym,
+                    ) {
+                        // Result mentions k_sym (output frame).  Remap to
+                        // input axis position.
+                        if crate::ops::logic::sym_to_coord_axis(k_sym) != Some(*k_in_pos) {
+                            let scope = k_sym.scope()?;
+                            let mut m: HashMap<Symbol, TDim> = HashMap::new();
+                            m.insert(k_sym.clone(), TDim::Sym(scope.coord_sym(*k_in_pos)));
+                            return band.substitute_all(&m).ok();
+                        }
+                        return Some(band);
+                    }
+                }
+            }
+            None
+        };
+        let result: TVec<Option<TDim>> =
+            (0..node.inputs.len()).map(|ix| project_for_input(ix)).collect();
+        Ok(Some(result))
     }
 
     fn axes_mapping(
@@ -341,6 +415,9 @@ impl TypedOp for EinSum {
         if let Some(patch) = declutter_broadcast(self, session, model, node)? {
             return Ok(Some(patch));
         }
+        if let Some(patch) = unit_k_to_broadcast_mul(self, model, node)? {
+            return Ok(Some(patch));
+        }
         Ok(None)
     }
 
@@ -353,6 +430,14 @@ impl TypedOp for EinSum {
             (self.q_params.is_none() && node.inputs.len() == 2)
                 || (self.q_params.is_some() && node.inputs.len() == 9)
         );
+        // Some EinSums are introduced during codegen itself (e.g. ConvTranspose lowering
+        // emits an EinSum + DeconvSum pair). Those don't get a chance to go through declutter
+        // before being lowered, so we re-check the unit-K → broadcast-Mul rule here as a
+        // fast path. For EinSums that already existed at declutter time, this is a no-op
+        // (the declutter pass would already have rewritten them).
+        if let Some(patch) = unit_k_to_broadcast_mul(self, model, node)? {
+            return Ok(Some(patch));
+        }
         einsum_matmul::detect_rule(&(), model, node, &node.name, self)
     }
 
@@ -379,18 +464,14 @@ fn declutter_reshape_folding_input_axis(
             axes = axes.with_extra_axis(*label, InOut::In(extra_input), 0)?;
         }
         let folded_axis = op.axes.axis((InOut::In(slot), at))?;
-        if folded_axis.outputs[0].len() > 1 {
-            return Ok(None);
-        };
+        rule_if!(folded_axis.outputs[0].len() <= 1);
         let mut patch = TypedModelPatch::default();
         let mut taps = patch.taps(model, &node.inputs)?;
         for (input, tap) in taps.iter_mut().enumerate() {
             if folded_axis.inputs[input].len() == 0 {
                 continue;
             };
-            if folded_axis.inputs[input].len() > 1 {
-                return Ok(None);
-            };
+            rule_if!(folded_axis.inputs[input].len() <= 1);
             let pos = folded_axis.inputs[input][0];
             for label in &extra_labels {
                 axes = axes.with_extra_axis_occurency(*label, InOut::In(input), pos)?;
@@ -441,4 +522,153 @@ fn declutter_broadcast(
         }
     }
     Ok(None)
+}
+
+/// Rewrite an EinSum whose contraction product is statically 1 as a broadcast Mul.
+///
+/// Triggers when:
+/// - All "k-like" axes (present in both inputs, absent from output) have shape 1 in both inputs, OR
+/// - There are no k-like axes at all (Hadamard products like `mn,mn->mn`, outer products like
+///   `m,n->mn`, or any pure broadcast pattern).
+///
+/// In both cases the einsum has no real contraction work — it's a broadcast multiplication
+/// dressed up as an einsum. Lowering it as a matmul leaves the GEMM kernel running per-tile
+/// setup (clear, panel-load, store) for at most one FMA, so a direct broadcast Mul is much
+/// faster on Native (and a net semantic simplification regardless of perf).
+///
+/// Quantized einsums are left untouched: the existing `dequant` path in `EinSumMatMul::codegen`
+/// produces a non-q einsum that this rule then catches naturally on the next declutter pass.
+fn unit_k_to_broadcast_mul(
+    op: &EinSum,
+    model: &TypedModel,
+    node: &TypedNode,
+) -> TractResult<Option<TypedModelPatch>> {
+    if op.q_params.is_some() || node.inputs.len() != 2 {
+        return Ok(None);
+    }
+    let input_facts = model.node_input_facts(node.id)?;
+    let input_shapes = op.actual_input_shapes_from_facts(&input_facts)?;
+    let k_axes: TVec<&Axis> = op
+        .axes
+        .iter_all_axes()
+        .filter(|a| a.inputs[0].len() == 1 && a.inputs[1].len() == 1 && a.outputs[0].is_empty())
+        .collect();
+    // Bail if any k-axis is non-trivial — that's a real contraction, leave it to matmul lowering.
+    let any_nontrivial_k = k_axes.iter().any(|a| {
+        !input_shapes[0][a.inputs[0][0]].is_one() || !input_shapes[1][a.inputs[1][0]].is_one()
+    });
+    if any_nontrivial_k {
+        return Ok(None);
+    }
+    // Scope: only fire when this einsum's output is consumed by a DeconvSum (i.e. it was
+    // emitted by the ConvTranspose lowering pipeline in `Deconv::wire_with_deconv_sum`).
+    // That's the original target case (DFN3 / GTCRN depthwise ConvTranspose with 1×N kernel
+    // collapsing to K=1 — see PR #2183). Other K=1 einsums (e.g. degenerate Q@K^T inside
+    // SDPA when head_dim=1, random-shape proptests with K=1) are intentionally left alone:
+    // backend-specific pipelines (Metal SDPA fusion, MetalMul rank-4 broadcast-segment limit,
+    // …) pattern-match on the matmul shape and break when we substitute a Mul.
+    let has_deconv_sum_consumer = node.outputs.first().map_or(false, |o| {
+        o.successors.iter().any(|inlet| model.node(inlet.node).op.name() == "DeconvSum")
+    });
+    if !has_deconv_sum_consumer {
+        return Ok(None);
+    }
+
+    let one = TDim::one();
+    // Reject "non-trivial single-side disappearing" axes — those need a real reduction.
+    for axis in op.axes.iter_all_axes() {
+        let in_left =
+            axis.inputs[0].first().map(|pos| &input_shapes[0][*pos]).unwrap_or(&one) != &one;
+        let in_right =
+            axis.inputs[1].first().map(|pos| &input_shapes[1][*pos]).unwrap_or(&one) != &one;
+        let in_out = !axis.outputs[0].is_empty();
+        if (in_left ^ in_right) && !in_out {
+            return Ok(None);
+        }
+    }
+
+    let c_axes: Vec<char> = op.axes.axes(InOut::Out(0)).map(|a| a.repr).collect();
+    if c_axes.is_empty() {
+        return Ok(None);
+    }
+
+    let k_reprs: TVec<char> = k_axes.iter().map(|a| a.repr).collect();
+    let mut patch = TypedModelPatch::new("EinSum unit-K → broadcast Mul");
+    let mut wires: TVec<OutletId> = patch.taps(model, &node.inputs)?;
+    let name = &node.name;
+
+    for (slot, wire) in wires.iter_mut().enumerate() {
+        // Promote inputs to operating_dt so the result type matches EinSum::output_facts
+        // (e.g. i8 inputs with i32 operating_dt for an integer matmul that has been dequantized).
+        let cur_dt = patch.outlet_fact(*wire)?.datum_type;
+        if cur_dt != op.operating_dt {
+            *wire = patch.wire_node(
+                format!("{name}.cast_in{slot}"),
+                crate::ops::cast::cast(op.operating_dt),
+                &[*wire],
+            )?[0];
+        }
+
+        // Drop k axes (sorted descending so positions stay valid).
+        let mut k_positions: Vec<usize> = k_axes.iter().map(|a| a.inputs[slot][0]).collect();
+        k_positions.sort_by(|a, b| b.cmp(a));
+        for (i, pos) in k_positions.into_iter().enumerate() {
+            *wire =
+                patch.wire_node(format!("{name}.rm_k_in{slot}.{i}"), AxisOp::Rm(pos), &[*wire])?[0];
+        }
+
+        let mut current: Vec<char> = op
+            .axes
+            .axes(InOut::In(slot))
+            .map(|a| a.repr)
+            .filter(|c| !k_reprs.contains(c))
+            .collect();
+
+        // Drop any remaining axes not in output (must be size 1 by precondition above).
+        let mut to_drop: Vec<(usize, char)> = current
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c_axes.contains(c))
+            .map(|(i, c)| (i, *c))
+            .collect();
+        to_drop.sort_by(|a, b| b.0.cmp(&a.0));
+        for (pos, c) in to_drop {
+            *wire = patch.wire_node(
+                format!("{name}.rm_extra_in{slot}_{c}"),
+                AxisOp::Rm(pos),
+                &[*wire],
+            )?[0];
+            current.remove(pos);
+        }
+
+        // Insert unit axes for output axes missing from this input.
+        for (target_pos, &t) in c_axes.iter().enumerate() {
+            if !current.contains(&t) {
+                *wire = patch.wire_node(
+                    format!("{name}.add_in{slot}_{t}"),
+                    AxisOp::Add(target_pos),
+                    &[*wire],
+                )?[0];
+                current.insert(target_pos, t);
+            }
+        }
+
+        // Permute to match output axis order.
+        for (target_pos, &t) in c_axes.iter().enumerate() {
+            let cur_pos = current.iter().position(|&c| c == t).unwrap();
+            if cur_pos != target_pos {
+                *wire = patch.wire_node(
+                    format!("{name}.move_in{slot}_{t}"),
+                    AxisOp::Move(cur_pos, target_pos),
+                    &[*wire],
+                )?[0];
+                let removed = current.remove(cur_pos);
+                current.insert(target_pos, removed);
+            }
+        }
+    }
+
+    let result = patch.wire_node(name, crate::ops::math::mul(), &wires)?;
+    patch.shunt_outside(model, node.id.into(), result[0])?;
+    Ok(Some(patch))
 }

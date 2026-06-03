@@ -89,7 +89,6 @@ pub const STAGES: &[&str] = &[
 fn main() -> TractResult<()> {
     use clap::*;
     let mut app = command!()
-        .allow_hyphen_values(true)
         .arg(arg!(--readings "Start readings instrumentation"))
         .arg(arg!(--"readings-heartbeat" [MS] "Heartbeat for readings background collector").default_value("5"))
         .arg(arg!(verbose: -v ... "Sets the level of verbosity.").action(clap::ArgAction::Count))
@@ -153,7 +152,8 @@ fn main() -> TractResult<()> {
         .arg(arg!(--"tflite-cycle" "Perform TFLITE dump and reload before optimizing"))
 
         .arg(arg!(--"no-nnef-tract-core" "Disable usage of tract-core extension in NNEF dump and load"))
-        .arg(arg!(--"nnef-tract-core" "Allow usage of tract-core extension in NNEF dump and load")).hide(true)
+        // deprecated: tract-core is now enabled by default
+        .arg(arg!(--"nnef-tract-core" "no-op, kept for backward compatibility").hide(true))
         .arg(arg!(--"nnef-tract-resource" "Allow usage of tract-resource extension in NNEF dump and load"))
         .arg(arg!(--"nnef-tract-onnx" "Allow usage of tract-onnx extension in NNEF dump and load"))
         .arg(arg!(--"nnef-tract-pulse" "Allow usage of tract-pulse extension in NNEF dump and load"))
@@ -979,8 +979,8 @@ fn nnef(matches: &clap::ArgMatches) -> tract_nnef::internal::Nnef {
             panic!("tract is build without tract-transformers support")
         }
     }
-    if !matches.get_flag("no-nnef-tract-core") {
-        fw = fw.with_tract_core();
+    if matches.get_flag("no-nnef-tract-core") {
+        fw = fw.without_tract_core();
     }
     if matches.get_flag("nnef-tract-resource") || matches.get_flag("opl") {
         use tract_nnef_resources::internal::JsonLoader;

@@ -5,6 +5,9 @@ use crate::x86_64_fma::softmax::x86_64_fma_softmax2_fastcompact_f32_32n;
 
 pub mod mmm;
 
+pub mod amx;
+pub mod amx_bf16;
+pub mod avxvnni;
 pub mod by_scalar;
 mod intel;
 pub mod max;
@@ -14,6 +17,7 @@ pub mod softmax;
 const AVX2: fn() -> bool = || is_x86_feature_detected!("avx2");
 const FMA: fn() -> bool = || is_x86_feature_detected!("fma");
 const AVX512F: fn() -> bool = || is_x86_feature_detected!("avx512f");
+const AVX512VNNI: fn() -> bool = || is_x86_feature_detected!("avx512vnni");
 
 tanh_impl!(f32, fma_tanh_f32, 8, 8, is_x86_feature_detected!("fma"));
 sigmoid_impl!(f32, fma_sigmoid_f32, 8, 8, is_x86_feature_detected!("fma"));

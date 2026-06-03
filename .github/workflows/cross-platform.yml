@@ -5,14 +5,57 @@ on:
   schedule:
     - cron:  '0 5 * * *'
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number to test (from fork ok). Leave empty to run on selected branch."
+        required: false
+        type: number
 
 env:
   CARGO_INCREMENTAL: false
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
   RUSTUP_TOOLCHAIN: 1.91.0
 
+permissions:
+  contents: read
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      test_ref: ${{ steps.set.outputs.test_ref }}
+      tract_bench_branch_name: ${{ steps.set.outputs.tract_bench_branch_name }}
+    steps:
+      - id: set
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            core.info(`event: ${context.eventName}`);
+            core.info(`payload.inputs: ${JSON.stringify(context.payload.inputs)}`);
+            core.info(`payload.pull_request.number: ${context.payload.pull_request?.number}`);
+            const prInput = context.payload.inputs?.pr_number ?? context.payload.pull_request?.number;
+            core.info(`prInput: ${prInput} (type: ${typeof prInput})`);
+            let ref, branch;
+            if (prInput) {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(prInput),
+              });
+              ref = pr.data.head.sha;
+              branch = `pr-${prInput}-${pr.data.head.ref}`;
+            } else {
+              ref = process.env.GITHUB_SHA;
+              branch = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME || 'main';
+            }
+            const benchBranch = branch.replace(/\//g, '_');
+            core.info(`test_ref: ${ref}`);
+            core.info(`tract_bench_branch_name: ${benchBranch}`);
+            core.setOutput('test_ref', ref);
+            core.setOutput('tract_bench_branch_name', benchBranch);
+
   linux:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +83,11 @@ jobs:
       contents: read
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
+        persist-credentials: false
 
     - name: Get current date
       id: date
@@ -48,12 +95,12 @@ jobs:
 
     - name: Configure AWS Credentials
       continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@v6
+      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
       with:
         role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
         aws-region: us-east-2
 
-    - uses: actions/cache@v5
+    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
         path: |
           ~/.rustup
@@ -65,16 +112,22 @@ jobs:
         key: ${{ runner.os }}-${{matrix.platform}}-${{steps.date.outputs.date}}
 
     - name: Setup wasmtime
-      if: ${{ matrix.platform }} == "wasm32-wasi"
-      uses: bytecodealliance/actions/wasmtime/setup@v1
+      if: matrix.platform == 'wasm32-wasi'
+      uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
 
     - name: Cross script
       env:
         PLATFORM: ${{matrix.platform}}
         AWS_EC2_METADATA_DISABLED: true
-      run: .travis/cross.sh
+        NEEDS_PREPARE_OUTPUTS_TRACT_BENCH_BRANCH_NAME: ${{ needs.prepare.outputs.tract_bench_branch_name }}
+        NEEDS_PREPARE_OUTPUTS_TEST_REF: ${{ needs.prepare.outputs.test_ref }}
+      run: |
+        export TRACT_BENCH_BRANCH_NAME="${NEEDS_PREPARE_OUTPUTS_TRACT_BENCH_BRANCH_NAME}"
+        export GITHUB_SHA="${NEEDS_PREPARE_OUTPUTS_TEST_REF}"
+        .travis/cross.sh
 
   apple:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -88,11 +141,15 @@ jobs:
       contents: read
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
+        persist-credentials: false
 
     - name: Configure AWS Credentials
       continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@v6
+      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
       with:
         role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
         aws-region: us-east-2
@@ -104,4 +161,9 @@ jobs:
     - name: Cross script
       env:
         PLATFORM: ${{matrix.platform}}
-      run: .travis/cross.sh
+        NEEDS_PREPARE_OUTPUTS_TRACT_BENCH_BRANCH_NAME: ${{ needs.prepare.outputs.tract_bench_branch_name }}
+        NEEDS_PREPARE_OUTPUTS_TEST_REF: ${{ needs.prepare.outputs.test_ref }}
+      run: |
+        export TRACT_BENCH_BRANCH_NAME="${NEEDS_PREPARE_OUTPUTS_TRACT_BENCH_BRANCH_NAME}"
+        export GITHUB_SHA="${NEEDS_PREPARE_OUTPUTS_TEST_REF}"
+        .travis/cross.sh

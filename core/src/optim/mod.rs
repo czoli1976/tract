@@ -8,6 +8,7 @@ mod concat_then_einsum;
 mod op_optim;
 mod prop_const;
 pub mod propagate_roi;
+pub mod propagate_uniform_tdim;
 mod push_split_down;
 mod slice;
 mod uniform_mask;
@@ -15,6 +16,7 @@ mod uniform_mask;
 use self::change_axes::ChangeAxes;
 use self::prop_const::PropConst;
 use self::propagate_roi::PropagateRoi;
+use self::propagate_uniform_tdim::PropagateUniformTdim;
 use self::push_split_down::PushSplitDown;
 use self::slice::PushSliceUp;
 use self::uniform_mask::FoldUniformMask;
@@ -30,6 +32,27 @@ pub trait TypedPass: Debug + Send + Sync + dyn_clone::DynClone {
     /// In-place model mutation hook. Returns true if the model was changed.
     fn run_direct(&mut self, _model: &mut TypedModel) -> TractResult<bool> {
         Ok(false)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergeConsecutiveSameRoleAxes;
+
+impl TypedPass for MergeConsecutiveSameRoleAxes {
+    fn reset(&mut self) -> TractResult<()> {
+        Ok(())
+    }
+    fn next(
+        &mut self,
+        _session: &mut OptimizerSession,
+        _model: &TypedModel,
+    ) -> TractResult<Option<TypedModelPatch>> {
+        Ok(None)
+    }
+    fn run_direct(&mut self, model: &mut TypedModel) -> TractResult<bool> {
+        let before = model.nodes.len();
+        crate::ops::einsum::einsum_matmul::merge_consecutive_same_role_axes(model)?;
+        Ok(model.nodes.len() != before)
     }
 }
 
@@ -69,6 +92,7 @@ impl Optimizer {
     pub fn declutter() -> Optimizer {
         Optimizer::passes(vec![
             Box::<PropConst>::default(),
+            Box::<PropagateUniformTdim>::default(),
             Box::<PropagateRoi>::default(),
             Box::<FoldUniformMask>::default(),
             Box::new(OpOptim("declutter", TypedOp::declutter_with_session, 0)),
@@ -82,6 +106,7 @@ impl Optimizer {
     pub fn codegen() -> Optimizer {
         Optimizer::passes(vec![
             Box::<PropConst>::default(),
+            Box::<MergeConsecutiveSameRoleAxes>::default(),
             Box::new(OpOptim(
                 "codegen",
                 |op, _session, model, node| TypedOp::codegen(op, model, node),

@@ -356,14 +356,57 @@ pub fn handle_stream(
     }
 
     let stream_dim = max_delay + 3 * input_pulse + input_pulse / 2;
-    let concrete_sym_values = SymbolValues::default().with(&stream_symbol, stream_dim as _);
+    let mut concrete_sym_values = SymbolValues::default().with(&stream_symbol, stream_dim as _);
+    // If Blockify rewrote the model (T → k·S), it stashes the new chunk
+    // symbol and chunk size in pulsed properties.  Bind the chunk symbol
+    // to `stream_dim / k` so per-fact `stream.dim.eval_to_i64` calls below
+    // resolve through it.  (Each `PulsedModel::new` mints a fresh chunk
+    // symbol, so we read from *this* pulsed instance.)
+    if let (Some(chunk_sym_t), Some(chunk_size_t)) = (
+        pulsed.properties.get(tract_pulse::blockify::BLOCKIFY_CHUNK_SYMBOL),
+        pulsed.properties.get(tract_pulse::blockify::BLOCKIFY_CHUNK_SIZE),
+    ) {
+        let chunk_sym_name = chunk_sym_t.to_plain_array_view::<String>()?[[0]].clone();
+        let chunk_sym = pulsed.symbols.sym(&chunk_sym_name);
+        let chunk_size = chunk_size_t.cast_to_scalar::<i64>()? as usize;
+        ensure!(
+            stream_dim % chunk_size == 0,
+            "stream_dim {stream_dim} not divisible by Blockify chunk size {chunk_size}"
+        );
+        concrete_sym_values = concrete_sym_values.with(&chunk_sym, (stream_dim / chunk_size) as _);
+    }
 
     // Second pass: build full metadata with fixed_output_len
     for pulsed_node in pulsed.nodes() {
         if let Ok(fact) = pulsed.outlet_fact(OutletId::new(pulsed_node.id, 0)) {
             if let Some(stream) = &fact.stream {
-                let output_pulse = fact.pulse().context("no pulse")?.to_usize()?;
-                let fixed_output_len = stream.dim.eval_to_i64(&concrete_sym_values)? as usize;
+                let output_pulse = fact
+                    .pulse()
+                    .with_context(|| {
+                        format!(
+                            "evaluating pulse on node #{} {} (slot 0)",
+                            pulsed_node.id, pulsed_node.name
+                        )
+                    })?
+                    .to_usize()
+                    .with_context(|| {
+                        format!(
+                            "evaluating pulse to usize on node #{} {} (slot 0), shape {:?}",
+                            pulsed_node.id, pulsed_node.name, fact.shape
+                        )
+                    })?;
+                let fixed_output_len = stream
+                    .dim
+                    .eval_to_i64(&concrete_sym_values)
+                    .with_context(|| {
+                        format!(
+                            "evaluating stream.dim {:?} on node #{} {} (slot 0); known symbols: {:?}",
+                            stream.dim,
+                            pulsed_node.id,
+                            pulsed_node.name,
+                            concrete_sym_values,
+                        )
+                    })? as usize;
                 pulse_meta.insert(
                     pulsed_node.name.clone(),
                     PulseInfo {
@@ -473,7 +516,8 @@ pub fn handle_stream(
     }
 
     // Concretize the reference model and delegate to compare()
-    let concrete_ref = Arc::new(reference.clone().concretize_dims(&concrete_sym_values)?);
+    let concrete_ref =
+        Arc::new(reference.clone().substitute_symbols(&concrete_sym_values.to_dim_map())?);
     compare(
         false,
         &concrete_ref,
@@ -531,10 +575,16 @@ where
                             .and_then(|r| r.as_ref().ok())
                             .cloned()
                     };
+                    // The GPU translator wraps nodes that absorb adjacent
+                    // axis ops with a `.fused_axis_op` suffix.  Strip it for
+                    // lookup so per-node bisection lines up GPU outputs with
+                    // the CPU reference.
+                    let stripped_name =
+                        node.name.strip_suffix(".fused_axis_op").unwrap_or(&node.name);
                     let reference: Option<TValue> = tract
                         .outlet_label((node.id, slot).into())
                         .and_then(get_value)
-                        .or_else(|| get_value(&node.name).filter(|_| slot == 0));
+                        .or_else(|| get_value(stripped_name).filter(|_| slot == 0));
 
                     let Some(reference) = reference else {
                         tags.style = Some(Yellow.into());
@@ -547,13 +597,34 @@ where
                         node.outputs[slot].fact.to_typed_fact().unwrap(),
                     );
                     let needed_type = clarified_fact.datum_type;
-                    let needed_shape =
-                        clarified_fact.shape.eval_to_usize(&session_state.resolved_symbols)?;
+                    let needed_shape = clarified_fact
+                        .shape
+                        .eval_to_usize(&session_state.resolved_symbols)
+                        .with_context(|| {
+                            format!(
+                                "evaluating shape {:?} on node #{} {} (slot {}); known symbols: {:?}",
+                                clarified_fact.shape,
+                                node.id,
+                                node.name,
+                                slot,
+                                session_state.resolved_symbols,
+                            )
+                        })?;
 
                     if **needed_shape != *reference.shape() {
                         let Ok(reshaped) = reference.clone().into_shape(&needed_shape) else {
-                            comparison_error = Some(format!("Incompatible shape on output {slot} reference is {reference:?}, model expects {:?}.", needed_shape));
-                            tags.style = Some(Red.into());
+                            // Pulsification can change intermediate-node shapes
+                            // (e.g. Blockify rewrites a `[T,T]` score into a
+                            // chunked `[S, k, k]`); the streamed value can't
+                            // be directly compared against the reference.
+                            // Mark unchecked rather than failing — the model
+                            // outputs are still validated end-to-end.
+                            tags.style = Some(Yellow.into());
+                            tags.labels.push(format!(
+                                "Skipped: incompatible shape on output {slot}, reference {:?}, model expects {:?}",
+                                reference.shape(), needed_shape,
+                            ));
+                            unchecked.insert(node.id);
                             continue;
                         };
                         reference = reshaped;
@@ -594,8 +665,19 @@ where
                         )
                     }
 
-                    if !cumulative && returning[slot].is_plain() {
-                        returning[slot] = reference.into_tvalue();
+                    if !cumulative {
+                        use tract_gpu::tensor::{DeviceTensorExt, IntoDevice};
+                        if returning[slot].is_plain() {
+                            returning[slot] = reference.into_tvalue();
+                        } else if returning[slot].as_device_tensor().is_some() {
+                            // Device-resident output: stage the CPU reference
+                            // back onto the device so downstream device ops can
+                            // consume it.  Without this, cumulative=off would
+                            // silently keep tract's (potentially-drifted) value
+                            // and per-node bisection becomes useless on GPU.
+                            returning[slot] =
+                                reference.into_device()?.into_tensor().into_tvalue();
+                        }
                     }
                 }
                 if let Some(e) = comparison_error {

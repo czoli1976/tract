@@ -9,8 +9,8 @@ for rt in $TRACT_RUNTIMES
 do
 	gpu_assert=""
 	case "$rt" in
-		--cuda) gpu_assert="--assert-op-only Cuda*,Gpu*,DeviceSync*,Const,Source,STFT,Pad,IsNan,Add,Range,Cast,Eq,Div,Sub,Scan,Gather";;
-		--metal) gpu_assert="--assert-op-only Metal*,Gpu*,DeviceSync*,Const,Source,STFT,Pad,IsNan,Add,Range,Cast,Eq,Div,Sub,Scan,Gather,Reduce*";;
+		--cuda) gpu_assert="--assert-op-only Cuda*,Gpu*,DeviceSync*,Const,Source,STFT,Pad,IsNan,Add,Range,Cast,Eq,Div,Sub,Scan,Gather,DiagGather";;
+		--metal) gpu_assert="--assert-op-only Metal*,Gpu*,DeviceSync*,Const,Source,STFT,Pad,IsNan,Add,Range,Cast,Eq,Div,Sub,Scan,Gather,Reduce*,DiagGather";;
 	esac
 
 	for m in preprocessor encoder decoder joint
@@ -21,14 +21,24 @@ do
 		else
 			nnef_file=nvidia--parakeet-tdt-0.6b-v3-f32f32.$m.nnef.tgz
 		fi
+		# decoder LSTM is externally state-managed (caller plumbs state_0/
+		# state_1 every run): force the external_state flag on Scans
+		# pre-optimisation so declutter_single_loop inlines them, and assert
+		# no Scan survives. Cached NNEF predates the flag — see #2157.
+		extra_transform=""
+		extra_assert=""
+		if [ "$m" = "decoder" ]; then
+			extra_transform="-t force_scan_external_state"
+			extra_assert="--assert-op-count Scan 0"
+		fi
 		$CACHE_FILE \
 			asr/608/nvidia--parakeet-tdt-0.6b-v3-f32f32/$nnef_file \
 			asr/608/nvidia--parakeet-tdt-0.6b-v3-f32f32/nvidia--parakeet-tdt-0.6b-v3-f32f32.$m.io.npz
 
 		$TRACT_RUN $MODELS/asr/608/nvidia--parakeet-tdt-0.6b-v3-f32f32/$nnef_file $rt \
-			--nnef-tract-transformers -t transformers_detect_all run \
+			--nnef-tract-transformers -t transformers_detect_all $extra_transform run \
 			--input-from-bundle $MODELS/asr/608/nvidia--parakeet-tdt-0.6b-v3-f32f32/nvidia--parakeet-tdt-0.6b-v3-f32f32.$m.io.npz \
 			--assert-output-bundle $MODELS/asr/608/nvidia--parakeet-tdt-0.6b-v3-f32f32/nvidia--parakeet-tdt-0.6b-v3-f32f32.$m.io.npz \
-			--approx very $gpu_assert
+			--approx very $gpu_assert $extra_assert
 	 done
 done
