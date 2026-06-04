@@ -256,16 +256,16 @@ pub enum SymbolValueSpec {
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-pub struct ConcretizeSymbolsConfig {
+pub struct SetSymbolsConfig {
     pub values: std::collections::HashMap<String, SymbolValueSpec>,
 }
 
 #[derive(Debug)]
-struct ConcretizeSymbolsTransform(ConcretizeSymbolsConfig);
+struct SetSymbolsTransform(SetSymbolsConfig);
 
-impl ModelTransform for ConcretizeSymbolsTransform {
+impl ModelTransform for SetSymbolsTransform {
     fn name(&self) -> StaticName {
-        "concretize_symbols".into()
+        "set_symbols".into()
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
@@ -281,26 +281,26 @@ impl ModelTransform for ConcretizeSymbolsTransform {
             };
             subs.insert(sym, dim);
         }
-        *model = model.substitute_symbols(&subs)?;
+        *model = model.set_symbols(&subs)?;
         Ok(())
     }
 }
 
-register_model_transform!("concretize_symbols", ConcretizeSymbolsConfig, |config| Ok(Box::new(
-    ConcretizeSymbolsTransform(config)
+register_model_transform!("set_symbols", SetSymbolsConfig, |config| Ok(Box::new(
+    SetSymbolsTransform(config)
 )));
 
 /// Ad-hoc fix-up for NNEF artifacts exported before Scan grew the
-/// `external_state` flag (issue #2157). For every Scan in the model:
-/// 1. Substitute the scan-axis symbol on the Scan input with 1 across the
-///    whole model (caller is bound by the per-call seq=1 contract that
-///    external state management implies).
-/// 2. Set `external_state = true`.
+/// `external_state` flag (issue #2157). Sets `external_state = true` on every
+/// Scan, asserting that the caller plumbs initial state in and reads final
+/// state out each call. Apply only when the loaded model is known to use
+/// external state management, e.g. the parakeet decoder. Cheaper than
+/// re-exporting cached NNEF.
 ///
-/// After this transform, the standard declutter pipeline sees `iters == 1`
-/// on each Scan and `declutter_single_loop` inlines the body. Apply only
-/// when the loaded model is known to use external state management, e.g.
-/// the parakeet decoder. Cheaper than re-exporting cached NNEF.
+/// This does *not* touch the sequence dimension. Inlining the Scan body via
+/// `declutter_single_loop` additionally requires `iters == 1`, which is the
+/// caller's per-call contract — concretize it explicitly (e.g. `--set
+/// TARGETS__TIME=1`), separately from this flag.
 #[derive(Debug)]
 struct ForceScanExternalState;
 
@@ -310,22 +310,7 @@ impl ModelTransform for ForceScanExternalState {
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        use crate::ops::scan::{InputMapping, Scan};
-        let mut subs: HashMap<Symbol, TDim> = HashMap::new();
-        for node in &model.nodes {
-            let Some(scan) = node.op_as::<Scan>() else { continue };
-            for (slot, mapping) in scan.input_mapping.iter().enumerate() {
-                let InputMapping::Scan(info) = mapping else { continue };
-                let outer = node.inputs[slot];
-                let dim = &model.outlet_fact(outer)?.shape[info.axis];
-                if let TDim::Sym(s) = dim {
-                    subs.insert(s.clone(), TDim::Val(1));
-                }
-            }
-        }
-        if !subs.is_empty() {
-            *model = model.substitute_symbols(&subs)?;
-        }
+        use crate::ops::scan::Scan;
         for node in &mut model.nodes {
             if let Some(scan) = node.op_as_mut::<Scan>() {
                 scan.external_state = true;
@@ -360,6 +345,28 @@ impl ModelTransform for SelectOutputsTransform {
 
 register_model_transform!("select_outputs", SelectOutputsConfig, |config| Ok(Box::new(
     SelectOutputsTransform(config)
+)));
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct SelectInputsConfig {
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SelectInputsTransform(SelectInputsConfig);
+
+impl ModelTransform for SelectInputsTransform {
+    fn name(&self) -> StaticName {
+        "select_inputs".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        model.select_inputs_by_name(self.0.inputs.iter())
+    }
+}
+
+register_model_transform!("select_inputs", SelectInputsConfig, |config| Ok(Box::new(
+    SelectInputsTransform(config)
 )));
 
 inventory::submit! {
