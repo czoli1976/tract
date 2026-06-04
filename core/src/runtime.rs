@@ -105,7 +105,7 @@ pub struct DefaultRuntime;
 
 impl Runtime for DefaultRuntime {
     fn name(&self) -> StaticName {
-        Cow::Borrowed("default")
+        Cow::Borrowed("cpu")
     }
 
     fn prepare_with_options(
@@ -215,7 +215,34 @@ pub fn runtimes() -> impl Iterator<Item = &'static dyn Runtime> {
     inventory::iter::<InventorizedRuntime>().filter(|rt| rt.check().is_ok()).map(|ir| ir.0)
 }
 
+/// Known GPU backends, tried in order when resolving the virtual `gpu`
+/// (strict) / `gpu-or-cpu` (best-effort) names.
+const GPU_RUNTIME_NAMES: &[&str] = &["metal", "cuda"];
+
 pub fn runtime_for_name(s: &str) -> TractResult<Option<&'static dyn Runtime>> {
+    // Back-compat: `default` was the original name for the CPU runtime
+    // before it was renamed.  Keep it working as a plain alias.
+    let s = if s == "default" { "cpu" } else { s };
+    if s == "gpu" || s == "gpu-or-cpu" {
+        let mut last_check_err: Option<TractError> = None;
+        for name in GPU_RUNTIME_NAMES {
+            let Some(rt) = inventory::iter::<InventorizedRuntime>().find(|rt| rt.name() == *name)
+            else {
+                continue;
+            };
+            match rt.check() {
+                Ok(()) => return Ok(Some(rt.0)),
+                Err(e) => last_check_err = Some(e),
+            }
+        }
+        if s == "gpu" {
+            let detail =
+                last_check_err.map(|e| format!(" (last backend error: {e:#})")).unwrap_or_default();
+            bail!("Runtime `gpu` requested but no GPU backend is available{detail}");
+        }
+        // gpu-or-cpu: fall through to the cpu runtime.
+        return runtime_for_name("cpu");
+    }
     rule_if_some!(rt = inventory::iter::<InventorizedRuntime>().find(|rt| rt.name() == s));
     rt.check()?;
     Ok(Some(rt.0))
