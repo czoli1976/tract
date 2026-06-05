@@ -290,6 +290,22 @@ branches rather than writing a new kernel** — it is a *consumer* of that inves
 maximizes the ROI of #3/#13/#14/#15. Tier A is independent of all of them and can land
 first.
 
+### Relationship to sonos/tract#2329 (KIVI KV-cache quant) — no conflict, compounding
+
+sonos/tract#2329 adds **KIVI-style KV-cache quantization** in `transformers/`
+(`QuantKeyCache`/`QuantValueCache`/`QuantizedKvSdpa`: per-channel keys, per-token values,
+packed u8, ~4× vs f32). It quantizes **activations stored in the KV cache**, not weights —
+disjoint files and a disjoint layer from a ternary weight `BlockQuant`
+(`linalg/src/frame/block_quant/` + `core/src/ops/matmul`). So **no conflict**.
+
+They are in fact **complementary and compounding**: decode memory traffic ≈ *weights* +
+*KV-cache reads*. #2329 shrinks the KV half; ternary shrinks the weight half. Better still,
+they reinforce each other through Amdahl — once #2329 cuts KV traffic ~4×, weights become
+an even larger share of what remains, so ternary's *end-to-end* decode speedup grows rather
+than shrinks. Together they address the whole decode memory budget. The only shared surface
+is conceptual ("quantization") plus both extending NNEF serialization with new ops/formats
+— additive, low collision risk, not a real overlap.
+
 ## What is *not* worth porting
 
 - **Determinism guarantees / 21 dtypes / DNA-engine / target-prop** — training-side and
