@@ -212,6 +212,84 @@ The only GPU items Loom has that tract doesn't are **WebGPU/WASM browser targeti
 **runtime WGSL string generation** — portability/reach features, not inference-speed
 levers. Conclusion: skip the GPU angle entirely.
 
+## Speed prediction (roofline) and which targets benefit
+
+**Decisive fact (verified in code):** tract's block-quant is, today, a *runtime
+bandwidth* optimization, not a compute one. `Q4_0::extract_at_k_t`
+(`q4_0.rs:70–112`) reads the **compressed** weights from RAM (`EagerPackedInput.packed`)
+and dequantizes a tile into an **f16/f32 scratch panel at matmul time**; the micro-kernel
+then runs in float. So weights cost their *compressed* bytes in DRAM traffic, but compute
+is unchanged f16 + a small per-element dequant tax.
+
+That splits the ternary win into two tiers:
+
+### Tier A — minimal: ternary as a new `BlockQuant`, dequant→f16, reuse existing fp kernels
+Pure bandwidth play; compute unchanged. Risk low, effort ≈ `q4_0.rs` + plumbing.
+
+### Tier B — full BitNet: ternary weights + int8 activations → i8→i32 GEMM
+Routes to integer kernels so compute drops too. Needs activation int8 quant in the matmul
+prologue + accuracy validation; correct for BitNet-trained models (or with accuracy loss
+on general models). **This fork already has the hard part** (see PR-fit below).
+
+### Bytes per weight (the lever)
+| format  | bytes/weight | bits | vs f16 | vs q4_0 |
+|---------|-------------|------|--------|---------|
+| f16     | 2.0         | 16   | 1.0×   | 0.28×   |
+| q4_0    | 0.5625      | 4.5  | 3.6×   | 1.0×    |
+| ternary (≈2.06 bpw, 256-block) | 0.258 | 2.06 | **7.8×** | **2.2×** |
+| ternary (≈2.5 bpw, 32-block)   | 0.313 | 2.5  | 6.4×   | 1.8×    |
+
+### Predicted speedup
+Decode (batch=1 GEMV) is **memory-bound**: per-matmul time ∝ weight bytes, so the table's
+ratio is the *ceiling*. Prefill/large-batch is **compute-bound**: the bandwidth lever does
+~nothing there.
+
+| regime                         | Tier A (dequant→f16)            | Tier B (→ int8 i32 kernels)        |
+|--------------------------------|----------------------------------|-------------------------------------|
+| **Decode, per big matmul**     | ~1.3–1.7× vs q4_0; ~4–6× vs f16  | ~1.8–2.1× vs q4_0; ~6–7× vs f16 (nears ceiling — dequant tax removed) |
+| **Decode, end-to-end token/s** | ~1.3–1.5× vs q4_0; ~2.5–3× vs f16 (Amdahl: weight-GEMVs ≈65–80% of decode traffic) | ~1.5–1.7× vs q4_0; ~3–4× vs f16 |
+| **Prefill / batched**          | ~parity with f16 (dequant tax)   | compute-bound on int8 → leverages this fork's VNNI (~9–13× AVX2) / AMX (228–280 Gelem/s) kernels → potentially **1.5–3×+ vs f16 prefill** |
+| **Model footprint (capability)** | 7.8× smaller than f16, 2.2× smaller than q4_0 — e.g. 7B ≈ 1.8 GB vs f16 14 GB; lets bigger models fit in RAM/cache on constrained devices |
+
+Caveats: ceilings assume bandwidth-bound with no compute floor; as bytes/weight shrink the
+dequant + kernel cost becomes the floor (why Tier A < ceiling, and why Tier B — cheap int8
+compute — gets closer). Amdahl caps end-to-end gain because attention/KV/norms/sampling
+don't shrink. **Numbers are predictions; validate with `linalg/matmul-bench` (GEMV/GEMM)
+before committing.**
+
+### Which targets benefit (ranked)
+1. **LLM decode, batch=1** — primary beneficiary, any CPU (memory-bound).
+2. **Bandwidth-limited ARM (embedded/mobile)** — biggest *relative* win; footprint also
+   lets models fit that previously didn't. Tier A alone helps; Tier B via arm64 SDOT/i8mm.
+3. **x86 with AVX-512-VNNI / AMX** (this dev box has `avx512_vnni`; AMX on SPR/GNR) —
+   Tier B prefill compute win, reusing the fork's VNNI/AMX int8 GEMM.
+4. **arm64 with FEAT_DotProd (SDOT)** — Tier B via the fork's SDOT kernel.
+5. **WASM** — Tier A only (bandwidth + smaller download); WASM SIMD path is f32-only, no
+   int8 dot, so no Tier B there.
+
+Where it does **not** help: prefill-heavy / large-batch with Tier A; CNN/vision
+(compute-bound, large M); anything already compute-bound.
+
+## Fit with the open fork PRs (no clash; strong synergy)
+
+Reviewed all 14 open PRs (#2–#15). **None touch `linalg/src/frame/block_quant/` or add a
+weight storage/quant format** — they are compute kernels and activations. So a ternary
+`BlockQuant` is **purely additive; it replaces nothing** (in particular it does *not*
+replace `q4_0` — it's a sibling format the model selects).
+
+The synergy is the headline: the fork has already built exactly the **int8 i32 GEMM
+infrastructure Tier B needs**:
+- **#3** `avx512vnni_mmm_i32_8x8` (`vpdpbusd`, `PackedI8K4` layout)
+- **#13** arm64 SDOT int8 kernel (FEAT_DotProd)
+- **#14/#15** Intel AMX (`tdpbssd`, s8×s8, `PackedAmxA`) + AVX-VNNI ymm + VNNI 16×16
+
+A BitNet ternary path unpacks `{-1,0,+1}` weights to s8 and feeds these directly (AMX
+`tdpbssd` s8×s8 is the cleanest match; VNNI uses the existing +128/u8×s8 bias trick already
+implemented in #3). **Tier B should target `PackedI8K4` / `PackedAmxA` and rebase on those
+branches rather than writing a new kernel** — it is a *consumer* of that investment, which
+maximizes the ROI of #3/#13/#14/#15. Tier A is independent of all of them and can land
+first.
+
 ## What is *not* worth porting
 
 - **Determinism guarantees / 21 dtypes / DNA-engine / target-prop** — training-side and
