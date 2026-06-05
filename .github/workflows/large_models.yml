@@ -5,6 +5,11 @@ on:
   schedule:
     - cron:  '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number to test (from fork ok). Leave empty to run on selected branch."
+        required: false
+        type: number
 
 env:
   LARGE_MODELS: true
@@ -13,15 +18,42 @@ permissions:
   contents: read
 
 jobs:
-  cli: 
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      test_ref: ${{ steps.set.outputs.test_ref }}
+    steps:
+      - id: set
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const prInput = context.payload.inputs?.pr_number ?? context.payload.pull_request?.number;
+            let ref;
+            if (prInput) {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(prInput),
+              });
+              ref = pr.data.head.sha;
+            } else {
+              ref = process.env.GITHUB_SHA;
+            }
+            core.info(`test_ref: ${ref}`);
+            core.setOutput('test_ref', ref);
+
+  cli:
     name: Build tract on ${{ matrix.os }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ macos-latest, ubuntu-latest ]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ needs.prepare.outputs.test_ref }}
+          fetch-depth: 0
           persist-credentials: false
       - run: |
           ROOT=. ./.travis/ci-system-setup.sh
@@ -33,6 +65,7 @@ jobs:
           path: ./target/opt-no-lto/tract
 
   foundation-llms:
+    needs: prepare
     runs-on: ubuntu-latest
     outputs:
       models: ${{steps.set-matrix.outputs.models}}
@@ -55,7 +88,7 @@ jobs:
 
   foundation-llm:
     name: ${{ matrix.os }} / ${{matrix.rt}} / ${{ matrix.model }} / ${{ matrix.q }}
-    needs: [ cli, foundation-llms ]
+    needs: [ prepare, cli, foundation-llms ]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -84,12 +117,14 @@ jobs:
       contents: read
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - name: Configure AWS Credentials
       continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
+      uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
       with:
         role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
         aws-region: us-east-2
@@ -119,7 +154,7 @@ jobs:
 
   parakeet-tdt-600m-v3:
     name: ${{matrix.os}} / Parakeet TDT 600m v3
-    needs: [ cli ]
+    needs: [ prepare, cli ]
     strategy:
       matrix:
         os: [ macOS, cuda-lovelace ]
@@ -129,8 +164,10 @@ jobs:
       contents: read
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - run: echo uname=$(uname) >> $GITHUB_ENV
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -148,7 +185,7 @@ jobs:
 
   nemotron-speech-streaming-en-06b:
     name: ${{matrix.os}} / Nemotron speech streaming en 0.6b
-    needs: [ cli ]
+    needs: [ prepare, cli ]
     strategy:
       matrix:
         os: [ macOS, cuda-lovelace ]
@@ -158,8 +195,10 @@ jobs:
       contents: read
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - run: echo uname=$(uname) >> $GITHUB_ENV
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
