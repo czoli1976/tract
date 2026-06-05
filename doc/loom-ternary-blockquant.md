@@ -89,13 +89,66 @@ Step 1 is a self-contained, testable unit (round-trip quant/dequant + a referenc
 equality test, like the existing block_quant tests). Steps 2–3 are where the real
 latency win lands and should be benched against `q4_0` with `linalg/matmul-bench`.
 
+## Addendum: the L1/L2 cache claim
+
+Loom advertises "good L1/L2 cache optimisations in the kernels." Reading the source,
+the substance is **one** thing, and it is real and *not* present in tract:
+
+- `poly/tile_detection.go` **reads the machine's actual L1/L2/L3 sizes at runtime**
+  (Linux `/sys/devices/system/cpu/cpu0/cache/index*/size`, macOS `sysctl
+  hw.l1dcachesize`, Windows `wmic ... L2CacheSize,L3CacheSize`; fallbacks 32K/256K/8M)
+  and sizes the tile so the working set fits L1, dtype-aware
+  (`tileSize = L1 / (headDim * 2 * bytesPerWeight)`, clamped 8–256, 16-aligned).
+
+What it is *not*: the consuming kernel (`poly/dense.go`) is a plain **single-level
+square tile** (default 32) with batch-innermost loops — no panel packing, no register
+micro-kernel, no prefetch. So Loom's "cache optimisation" = *runtime cache-size-driven
+tile sizing*, bolted onto an otherwise naive loop.
+
+How tract compares:
+
+- tract is the *opposite* trade-off and far more sophisticated on the kernel side:
+  BLIS-style **packed panels** (`pack.rs`, `panel_extract.rs`, `PackedFormat`),
+  hand-tuned fixed-size register micro-kernels per ISA (`DynKernel<MR, NR>`, e.g. 8x8),
+  a `no_prefetch`/prefetch hook in `mmm/kernel.rs`, and a **measured `cost_model`** for
+  kernel selection.
+- **But** tract does **not** read hardware cache sizes anywhere (a grep for
+  `l1d`/`l2cache`/`sysconf`/sysfs cache paths finds nothing), and its matmul driver
+  (`run_with_scratch_space_row_outer` / `_col_outer` in `mmm/mod.rs`) is a **flat 2-D
+  sweep over register tiles** — `for ia in 0..m/mr { for ib in 0..n/nr { ker } }` — with
+  the micro-kernel reducing the **entire K dimension in one call**. There is **no
+  KC/MC/NC cache-blocking loop nest** (the classic Goto/BLIS L2/L3 blocking).
+
+The transferable, on-point idea (distinct from ternary above):
+
+> **Cache-size-aware K-blocking (KC tiling) for the matmul driver.** Loom's only real
+> contribution here is the *cache-size detection* half; tract has everything else but
+> currently leaves L2 A-panel reuse on the table for large-K matmuls.
+
+Concretely: with `K=4096, f32`, an `mr=8` A-panel is `8*4096*4 ≈ 128 KB` and the `nr`
+B-panel likewise — both far exceed a 32 KB L1, so in the row-outer loop the A-panel is
+evicted by B streaming and **re-fetched from L2/L3 for every one of the `n/nr` column
+blocks**. Blocking K into slabs `KC` sized so `mr*KC` (and `nr*KC`) fit L1/L2 — with `KC`
+chosen from a detected/benchmarked cache size — keeps the A sub-panel resident and reused
+across the whole N sweep, the textbook GEMM win. tract already measures memory bandwidth
+in `linalg/src/hwbench/bandwidth.rs`, so a one-time cache-size probe (sysfs/sysctl) or a
+`hwbench`-style auto-tuned `KC` would fit existing infrastructure.
+
+Honest caveats: (1) this mainly helps **large-K, large-N** shapes (prefill, big
+FFN/projection GEMMs); batch-1 **decode** is weight-bandwidth bound and benefits more
+from the ternary idea above. (2) tract's authors are GEMM specialists and may have
+concluded KC-blocking isn't worth it for their target shapes (weights packed once,
+reused across tokens) — so this must be **proven with `linalg/matmul-bench` on large-K
+shapes before committing**, not assumed.
+
 ## What is *not* worth porting
 
 - **Determinism guarantees / 21 dtypes / DNA-engine / target-prop** — training-side and
   product-positioning features, not inference-speed levers.
-- **MC tiling with hardware-autodetected tile size** — tract already solves tile/kernel
-  selection more rigorously via its measured `linalg/cost_model` and `hwbench`, and
-  hand-tuned per-ISA kernels. Loom's auto-detect is coarser than what tract has.
+- **Loom's square-tile CPU loop / GPU WGPU tiling** — tract's packed-panel + register
+  micro-kernel design already dominates this; porting the loop itself is pointless.
+  (The *one* salvageable sub-part — runtime cache-size detection to drive **KC**
+  blocking — is broken out as its own recommendation in the addendum above.)
 - **Plan 9 asm / WebGPU paths** — tract's NEON/FMA/AVX-512 asm and metal/cuda/gpu
   backends already exceed Loom's coverage here.
 
