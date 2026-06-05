@@ -231,6 +231,15 @@ Routes to integer kernels so compute drops too. Needs activation int8 quant in t
 prologue + accuracy validation; correct for BitNet-trained models (or with accuracy loss
 on general models). **This fork already has the hard part** (see PR-fit below).
 
+**A and B are not alternatives — B layers on A.** They share the ternary storage format,
+the weight (de)quant, and all model plumbing; B only adds a second *consumption* path
+(unpack to int8 instead of f16) plus activation int8 quant and integer-kernel routing. So
+A is never throwaway. They differ at *dispatch time* (a given matmul runs one path) and,
+crucially, in *numerics*: A keeps full-precision activations (lossless beyond the weight
+quant, usable on any model, like q4_0); B quantizes activations too (extra error, opt-in,
+for BitNet models / int8-capable targets). The mature end state keeps both and picks per
+target/model — e.g. WASM→A, VNNI/AMX/SDOT + BitNet model→B. Ship A first.
+
 ### Bytes per weight (the lever)
 | format  | bytes/weight | bits | vs f16 | vs q4_0 |
 |---------|-------------|------|--------|---------|
