@@ -141,6 +141,77 @@ concluded KC-blocking isn't worth it for their target shapes (weights packed onc
 reused across tokens) — so this must be **proven with `linalg/matmul-bench` on large-K
 shapes before committing**, not assumed.
 
+## Addendum 2: calibrating against Loom's published benchmarks
+
+`poly/asm/README.md` gives the only hard numbers (arm64/Metal, May 2026), as
+**Go-reference vs Loom-ASM** speedups:
+
+| dtype   | single-core | multi-core |
+|---------|-------------|------------|
+| Uint4   | 2.29×       | **3.55×**  |
+| Uint8   | 2.46×       | 3.19×      |
+| Ternary | ~2.0–2.2×   | ~3.2×      |
+| FP4     | ~2.0–2.2×   | ~3.2×      |
+| Float32 | ~1.11×      | ~parity    |
+| Float64 | 0.85×       | (slower)   |
+
+Two things these numbers **do** tell us, and one big thing they **don't**:
+
+- **Supports the ternary thesis (direction, not magnitude):** the low-bit/integer paths
+  get by far the largest wins (3.2–3.55× MC) while float is at parity — i.e. the payoff
+  in Loom is concentrated exactly where tract has no offering today. It confirms low-bit
+  integer kernels are where the headroom is.
+- **Do NOT translate to a tract multiplier:** these compare Loom-asm to *Loom's own naive
+  Go*. tract has no slow scalar baseline — it is already hand-tuned asm with packing and a
+  cost model. So "3.55×" is "how far Loom's asm is ahead of Loom's Go," **not** a speedup
+  tract would see. The honest tract expectation for ternary is the **memory-bandwidth**
+  win (smaller weight stream on bandwidth-bound decode) plus modest compute savings from
+  add-only accumulation — single-digit-percent-to-low-x on decode, to be measured, not a
+  3× claim.
+
+Two important corrections to the body above, learned from the docs:
+
+1. **Loom's CPU low-bit path is *not* bit-packed** — `poly/asm/README.md` states it keeps
+   "one quant byte per weight in RAM (`[]uint8` from morph)"; bit-packing into `[]uint32`
+   is **GPU-only**. So on CPU Loom spends 8 bits/weight for ternary and gets its speedup
+   purely from the integer kernel, leaving the bandwidth win on the table. tract's
+   `BlockQuant` packing (q4_0 already packs to nibbles) would let a tract ternary format
+   **beat Loom on the CPU bandwidth axis**, not just match it — the opportunity is larger
+   for tract than Loom's own CPU realization.
+2. **Loom's "L2/L3 cache locality" is mesh-level, not GEMM-level** — `docs/dispatch.md`
+   ties it to blocking the 3D layer grid into "4×4×4 cell groups," i.e. traversal-order
+   locality across *layers/cells*, not KC/MC blocking inside a matmul micro-kernel. So
+   Loom does **not** actually demonstrate kernel cache-blocking that tract lacks; the
+   KC-blocking idea in Addendum 1 is a tract-internal opportunity, and Loom's only genuine
+   contribution to it remains the *runtime cache-size detection*, not a kernel design.
+
+Net: the ternary block-quant remains the strongest transferable idea; the cache angle is
+real but smaller and must be benchmarked. Neither should be sold with Loom's 3× figure.
+
+## Addendum 3: the GPU doc — nothing transferable, tract is already ahead
+
+`docs/gpu.md` lists five things it claims are "relevant to multi-backend engines like
+tract." Checked against tract's `metal/` crate, **all five are already implemented**, so
+there is no GPU speed idea to port:
+
+| Loom GPU "idea"                     | tract status | evidence |
+|-------------------------------------|--------------|----------|
+| Single-command-buffer submit (BeginFrame/FlushFrame) | **already does it** | ops encode via `dispatch_eval` into one shared, lazily-created command buffer (`MetalStream::command_buffer` `get_or_insert_with`, `metal/src/context.rs`); production op path `eval_with_session` → `dispatch_eval` never waits (`metal/src/ops/gemm.rs:96`); commit happens once at readback (`to_host`), not per op |
+| Pipeline cache                      | **already does it** | `cache_pipelines` + `cache_libraries` HashMaps, and pipelines are **preloaded** at startup (`preload_pipelines`, `context.rs`) |
+| Buffer / activation pool reuse      | **already does it** | `DeviceSessionHandler` memory arena with `memory_sizing_hints` (`metal/src/lib.rs` `prepare_with_options`), plus `retain_tensor`/`retained_tensors` lifetime management |
+| Bind-group caching                  | n/a for Metal | Metal binds args directly on the encoder; this is a WGPU-specific concern |
+| Quantized native-vs-FP32 dispatch split | **more rigorous in tract** | handled at graph-optimization time via `BlockQuant` + the transform/optimize pipeline, not a runtime per-layer flag |
+
+The per-kernel `stream.wait_until_completed()` calls that look like per-op syncs live only
+in the **single-op `eval()` convenience wrappers** (e.g. `metal/src/kernels/nn/softmax.rs`
+`eval`), used by tests/isolated execution — the graph runtime uses the non-waiting
+`dispatch_eval`. So tract's Metal path is already "one submit per forward," exactly Loom's
+headline pattern.
+
+The only GPU items Loom has that tract doesn't are **WebGPU/WASM browser targeting** and
+**runtime WGSL string generation** — portability/reach features, not inference-speed
+levers. Conclusion: skip the GPU angle entirely.
+
 ## What is *not* worth porting
 
 - **Determinism guarantees / 21 dtypes / DNA-engine / target-prop** — training-side and
