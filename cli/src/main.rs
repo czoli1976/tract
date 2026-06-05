@@ -187,9 +187,6 @@ fn main() -> TractResult<()> {
                 .help("Loading pipeline stage to compare with"),
         )
         .arg(
-            Arg::new("tf").long("tf").action(ArgAction::SetTrue).help("Compare against tensorflow"),
-        )
-        .arg(
             Arg::new("twice")
                 .long("twice")
                 .action(ArgAction::SetTrue)
@@ -210,7 +207,7 @@ fn main() -> TractResult<()> {
         )
         .group(
             ArgGroup::new("reference")
-                .args(&["npz", "pbdir", "stage", "tf", "twice", "stream"])
+                .args(&["npz", "pbdir", "stage", "twice", "stream"])
                 .required(true),
         )
         .arg(
@@ -559,7 +556,8 @@ fn run_options(command: clap::Command) -> clap::Command {
                 .long("set")
                 .action(clap::ArgAction::Append)
                 .number_of_values(1)
-                .help("Set a symbol value before running the model (--set S=12)"),
+                .help("Bind a symbol before running the model.  RHS is a TDim expression \
+                       reduced to i64 against symbols set so far (--set S=12, --set T=2*S)."),
         )
         .arg(
             Arg::new("input-from-nnef").long("input-from-nnef").num_args(1).help(
