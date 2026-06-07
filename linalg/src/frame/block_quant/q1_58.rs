@@ -625,4 +625,65 @@ mod tests {
         run(Q8_1, "Q8_1", m, k, r)?;
         Ok(())
     }
+
+    // Decode-shaped (N=1) end-to-end GEMV through the *real* generic mmm kernel, weights
+    // sized to exceed this box's L3, comparing plain f32 weights vs Q4_0 vs Q1_58. This is
+    // the honest end-to-end Tier-A measurement (kernel compute + weight streaming together).
+    //
+    //   cargo test -p tract-linalg --lib block_quant::q1_58::tests::measure_decode_gemv \
+    //       --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_decode_gemv() -> TractResult<()> {
+        use crate::generic::mmm::generic_f32_4x1;
+        use crate::mmm::{AsInputValue, FusedSpec};
+        use std::time::Instant;
+
+        let (m, k) = (4096usize, 32768usize); // f32 512MB, Q4_0 72MB, Q1_58 40MB (all > 33MB L3)
+        let mmm = generic_f32_4x1.mmm();
+
+        let w = Tensor::zero::<f32>(&[m, k])?; // values irrelevant to timing
+        let x = Tensor::zero::<f32>(&[k, 1])?;
+
+        // (label, packing index on generic_f32_4x1, bytes/weight)
+        let cases = [("f32 ", 2usize, 4.0f64), ("Q4_0", 7, 18.0 / 32.0), ("Q1_58", 9, 10.0 / 32.0)];
+
+        println!("--- decode GEMV {m}x{k} x1 through generic_f32_4x1 (L3 = 33 MB) ---");
+        for (name, packing, bpw) in cases {
+            let (pa_fmt, pb_fmt) = &mmm.packings()[packing];
+            let pa = pa_fmt.prepare_one(&w, 1, 0)?;
+            let pb = pb_fmt.prepare_one(&x, 0, 1)?;
+            let mut c = Tensor::zero::<f32>(&[m])?;
+            let mb = m as f64 * k as f64 * bpw / 1e6;
+
+            let mut once = || -> TractResult<()> {
+                unsafe {
+                    mmm.run(
+                        m,
+                        1,
+                        &[
+                            FusedSpec::AddMatMul {
+                                a: AsInputValue::Borrowed(&*pa),
+                                b: AsInputValue::Borrowed(&*pb),
+                                packing,
+                            },
+                            FusedSpec::Store(mmm.c_view(Some(0), Some(0)).wrap(&c.view_mut())),
+                        ],
+                    )
+                }
+            };
+            once()?; // warmup
+            let iters = 5;
+            let t = Instant::now();
+            for _ in 0..iters {
+                once()?;
+            }
+            let ms = t.elapsed().as_secs_f64() / iters as f64 * 1e3;
+            println!(
+                "{name}: weights {mb:6.1} MB, {ms:7.1} ms/token, {:.1} GB/s (weight stream)",
+                mb / 1e3 / (ms / 1e3),
+            );
+        }
+        Ok(())
+    }
 }
