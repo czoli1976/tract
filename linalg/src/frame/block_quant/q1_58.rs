@@ -549,4 +549,80 @@ mod tests {
         }
         Ok(())
     }
+
+    // Reports two things per format: (1) the packed weight *footprint* (the unconditional
+    // Tier-A win), and (2) the cost of the scalar `extract_packed_panel` unpack into the
+    // f16 kernel panel.
+    //
+    // NOTE on interpretation: the unpack here is *compute-bound* on the scalar bit-unpack,
+    // and on a typical box the packed buffer fits in L3 — so this does NOT measure the
+    // DRAM-bandwidth win. (Byte-aligned Q8_1 even unpacks faster per byte than the
+    // bit-packed Q1_58/Q4_0.) The Tier-A *speed* win only appears in a real decode GEMV
+    // whose weights exceed last-level cache AND with a vectorized unpack (or via the
+    // Tier-B integer path that skips the f16 expansion). The footprint win, by contrast,
+    // is unconditional. See doc/loom-ternary-blockquant.md.
+    //
+    //   cargo test -p tract-linalg --lib block_quant::q1_58::tests::measure_unpack \
+    //       --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_unpack() -> TractResult<()> {
+        use std::time::Instant;
+
+        fn run(q: impl BlockQuant, name: &str, m: usize, k: usize, r: usize) -> TractResult<()> {
+            let weights: Vec<f32> =
+                (0..m * k).map(|i| ((i * 2654435761) % 7) as f32 - 3.0).collect();
+            let quant = q.quant_f32(&weights)?;
+            let packed = q.pack(&quant, k, r, 0, false)?;
+            let bytes = packed.packed.len();
+            let packer = PackedFormat::new(f16::datum_type(), r, 128);
+            let mut scratch = Tensor::zero::<f16>(&[k * r])?;
+            let panels = m.div_ceil(r);
+
+            // warmup + timed loop
+            let iters = (2_000_000_000usize / bytes.max(1)).clamp(3, 200);
+            for _ in 0..2 {
+                for p in 0..panels {
+                    unsafe {
+                        q.extract_packed_panel(
+                            &packed,
+                            &packer,
+                            p,
+                            scratch.as_bytes_mut().as_mut_ptr(),
+                        )?;
+                    }
+                }
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                for p in 0..panels {
+                    unsafe {
+                        q.extract_packed_panel(
+                            &packed,
+                            &packer,
+                            p,
+                            scratch.as_bytes_mut().as_mut_ptr(),
+                        )?;
+                    }
+                }
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let total_bytes = bytes as f64 * iters as f64;
+            println!(
+                "{name:7} {m}x{k}: packed {:.2} MB ({:.3} B/w), scalar-unpack {:.2} GB/s, {:.0} us/pass",
+                bytes as f64 / 1e6,
+                bytes as f64 / (m * k) as f64,
+                total_bytes / secs / 1e9,
+                secs / iters as f64 * 1e6,
+            );
+            Ok(())
+        }
+
+        let (m, k, r) = (4096, 4096, 8);
+        println!("--- per-matmul weight unpack (stream packed weights -> f16 panel) ---");
+        run(Q1_58, "Q1_58", m, k, r)?;
+        run(Q4_0, "Q4_0", m, k, r)?;
+        run(Q8_1, "Q8_1", m, k, r)?;
+        Ok(())
+    }
 }

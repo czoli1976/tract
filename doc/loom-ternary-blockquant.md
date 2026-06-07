@@ -279,6 +279,42 @@ before committing.**
 Where it does **not** help: prefill-heavy / large-batch with Tier A; CNN/vision
 (compute-bound, large M); anything already compute-bound.
 
+## Implementation status (this branch)
+
+Phases A and B are implemented in `linalg/src/frame/block_quant/`:
+
+- **`q1_58.rs`** — `Q1_58` / `BaseQ1_58<QK>`, a `BlockQuant` storing ternary `{-1,0,+1}`
+  as 2-bit codes (4/byte) + one f16 abs-mean scale/block. **2.5 bits/weight at QK=32**.
+  Implements the full trait (quant/dequant, `pack`, `extract_packed_panel`,
+  `extract_at_mn_*`), so it plugs into the existing dequant-to-f16 mmm path (Tier A) with
+  no kernel change.
+- **`helpers.rs`** — `CrumbReader`/`CrumbWriter` (2-bit packing), mirroring the nibble pair.
+- **Phase B** — `dequant_block_i8` emits raw ternary codes for an int8×int8→i32 dot;
+  `phase_b_integer_gemv_matches_f32` verifies that integer path reproduces the f32 dequant
+  GEMV within activation-quant tolerance. Routing it to the VNNI/AMX/SDOT i32 kernels is
+  the remaining (cross-PR) wiring.
+- **Tests**: 11 new (round-trip, abs-mean, pack/extract panel+row, integer GEMV); full
+  `tract-linalg` lib suite green (2620 + 11).
+
+### First measurement (this box: 4-core Xeon, 33 MB L3), `measure_unpack`
+
+| format | packed (4096×4096) | bits/weight |
+|--------|--------------------|-------------|
+| Q1_58  | **5.24 MB**        | 2.5         |
+| Q4_0   | 9.44 MB            | 4.5         |
+| Q8_1   | 18.87 MB           | 9.0         |
+
+The **footprint win is real and unconditional** — Q1_58 is 1.8× smaller than Q4_0 and 3.6×
+smaller than Q8_1 (and ~6.4× vs f16), exactly as predicted. But the *unpack-throughput*
+part of the same microbench is **compute-bound on the scalar bit-unpack** and the buffers
+fit in this box's 33 MB L3, so it does **not** show the bandwidth/speed win — byte-aligned
+Q8_1 even unpacks faster per byte than the bit-packed formats. This is the dequant-tax
+caveat from the roofline made concrete: **the Tier-A speed win needs (a) a real
+DRAM-bound decode GEMV (weights > LLC) and (b) a vectorized unpack** — or the Tier-B
+integer path that skips the f16 expansion entirely. Net: ship A for the guaranteed memory
+win now; the latency win wants a SIMD unpack kernel and/or Tier-B routing, and a
+decode-shaped end-to-end bench to measure.
+
 ## Fit with the open fork PRs (no clash; strong synergy)
 
 Reviewed all 14 open PRs (#2–#15). **None touch `linalg/src/frame/block_quant/` or add a
