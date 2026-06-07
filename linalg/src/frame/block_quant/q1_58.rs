@@ -1,0 +1,552 @@
+use crate::mmm::PackedExoticFact;
+
+use super::*;
+use num_traits::{AsPrimitive, Float, Zero};
+use std::alloc::Layout;
+
+/// Ternary (BitNet b1.58) block-quant: weights in {-1, 0, +1}, one f16 scale per block,
+/// codes packed 2 bits each (four per byte). With the default block of 32 this is
+/// `2 + 32/4 = 10` bytes per 32 weights == 2.5 bits/weight (vs Q4_0's 4.5 and f16's 16).
+///
+/// Codes on the wire: `-1 -> 0`, `0 -> 1`, `+1 -> 2` (code 3 unused), so a code `c`
+/// dequantizes to `(c as i8 - 1) * scale`. Quantization uses abs-mean scaling
+/// (`scale = mean(|w|)`), the standard BitNet b1.58 recipe.
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+pub struct BaseQ1_58<const QK: usize = 32>;
+
+pub const Q1_58: BaseQ1_58 = BaseQ1_58::<32>;
+
+impl<const QK: usize> Debug for BaseQ1_58<QK> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if QK == 32 { write!(f, "Q1_58") } else { write!(f, "BaseQ1_58<{QK}>") }
+    }
+}
+
+impl<const QK: usize> BaseQ1_58<QK> {
+    fn quant_block<T>(&self, block: &[T], quant: &mut [u8])
+    where
+        f32: From<T>,
+        T: Debug + Float,
+    {
+        assert!(quant.len() == self.block_bytes());
+        assert!(block.len() == self.block_len());
+        let mut writer = CrumbWriter::for_slice(quant);
+        let mut sum_abs = 0f32;
+        for v in block {
+            sum_abs += f32::from(*v).abs();
+        }
+        let scale = sum_abs / block.len() as f32;
+        let r_scale = if scale == 0f32 { 0f32 } else { scale.recip() };
+        writer.write_f16(f16::from_f32(scale));
+        for v in block {
+            // round-to-nearest, clamp to {-1, 0, +1}
+            let q = (f32::from(*v) * r_scale).round().clamp(-1f32, 1f32) as i8;
+            writer.write_crumb((q + 1) as u8);
+        }
+    }
+
+    fn dequant_block<T: Float + 'static>(&self, quant: &[u8], block: &mut [T])
+    where
+        f16: AsPrimitive<T>,
+        i8: AsPrimitive<T>,
+    {
+        assert!(quant.len() == self.block_bytes());
+        assert!(block.len() == self.block_len());
+        let mut reader = CrumbReader::for_slice(quant);
+        let d: T = reader.read_f16().as_();
+        for v in block {
+            let code = reader.read_crumb();
+            *v = (code as i8 - 1).as_() * d;
+        }
+    }
+
+    /// Phase B helper: dequantize a block into ternary codes `{-1, 0, +1}` (as i8) plus the
+    /// block's f16 scale, *without* applying the scale. This is the input an integer
+    /// (int8xint8 -> i32) GEMM kernel consumes: the i32 accumulator stays exact and the
+    /// scale is applied once per block in the epilogue.
+    pub fn dequant_block_i8(&self, quant: &[u8], codes: &mut [i8]) -> f16 {
+        assert!(quant.len() == self.block_bytes());
+        assert!(codes.len() == self.block_len());
+        let mut reader = CrumbReader::for_slice(quant);
+        let d = reader.read_f16();
+        for c in codes.iter_mut() {
+            *c = reader.read_crumb() as i8 - 1;
+        }
+        d
+    }
+
+    unsafe fn extract_panel_t<T: Float + Debug + 'static>(
+        &self,
+        value: &EagerPackedInput,
+        target: &PackedFormat,
+        panel: usize,
+        scratch: *mut u8,
+    ) -> TractResult<()>
+    where
+        f16: AsPrimitive<T>,
+        i8: AsPrimitive<T>,
+    {
+        let pbqf: &PackedBlockQuantFormat =
+            value.fact.format.downcast_ref().with_context(|| {
+                format!("Expecing PackedBlockQuantFormat, found {:?}", value.fact.format)
+            })?;
+        ensure!(pbqf.r == target.r);
+        ensure!(value.fact.k % self.block_len() == 0);
+        ensure!(*pbqf.bq == *(self as &dyn BlockQuant));
+        let scratch =
+            unsafe { std::slice::from_raw_parts_mut(scratch as *mut T, value.fact.k * target.r) };
+        let blocks_for_k = value.fact.k / self.block_len();
+        let row_bytes = blocks_for_k * self.block_bytes();
+        let input = &value.packed[panel * target.r * row_bytes..];
+        let mut scales = vec![T::zero(); target.r];
+        let mut scratch = scratch.iter_mut();
+        let mut codes = vec![0u8; pbqf.r];
+        let panel_block_bytes = target.r * self.block_bytes();
+        let (scale_offset, weights_offset) = if pbqf.scales_at_end {
+            (panel_block_bytes - target.r * f16::datum_type().size_of(), 0)
+        } else {
+            (0, target.r * f16::datum_type().size_of())
+        };
+        for block in 0..blocks_for_k {
+            let block = &input[block * panel_block_bytes..][..panel_block_bytes];
+            let mut s_reader = CrumbReader::for_slice(&block[scale_offset..]);
+            let mut w_reader = CrumbReader::for_slice(&block[weights_offset..]);
+            for s in &mut scales {
+                *s = s_reader.read_f16().as_();
+            }
+            for _ in 0..self.block_len() {
+                for c in &mut codes {
+                    *c = w_reader.read_crumb();
+                }
+                for (c, s) in codes.iter().zip(scales.iter()) {
+                    *scratch.next().unwrap() = *s * (*c as i8 - 1).as_();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_at_mn_t<T: Float + Debug + 'static>(
+        &self,
+        value: &EagerPackedInput,
+        mn: usize,
+        target: &mut [T],
+    ) -> TractResult<()>
+    where
+        f16: AsPrimitive<T>,
+        i8: AsPrimitive<T>,
+    {
+        let pbqf: &PackedBlockQuantFormat =
+            value.fact.format.downcast_ref().with_context(|| {
+                format!("Expecing PackedBlockQuantFormat, found {:?}", value.fact.format)
+            })?;
+        ensure!(value.fact.k % self.block_len() == 0);
+        ensure!(*pbqf.bq == *(self as &dyn BlockQuant));
+        ensure!(value.fact.mn.to_usize().ok().map(|it| mn < it).unwrap_or(true));
+        ensure!(value.fact.k == target.len());
+        let blocks_for_k = value.fact.k / self.block_len();
+        let row_bytes = blocks_for_k * self.block_bytes();
+        let panel = mn / pbqf.r;
+        let value = &value.packed[panel * pbqf.r * row_bytes..];
+        let mut target = target.iter_mut();
+        let row = mn % pbqf.r;
+        let panel_block_bytes = pbqf.r * self.block_bytes();
+        let (scale_offset, weights_offset) = if pbqf.scales_at_end {
+            (panel_block_bytes - pbqf.r * f16::datum_type().size_of(), 0)
+        } else {
+            (0, pbqf.r * f16::datum_type().size_of())
+        };
+        unsafe {
+            for block in 0..blocks_for_k {
+                let block = value.as_ptr().add(block * panel_block_bytes);
+                let scale = *((block.add(scale_offset) as *const f16).add(row));
+                let scale: T = scale.as_();
+                for i in 0..self.block_len() {
+                    // crumb index of (position i, this row) within the weight section
+                    let ci = i * pbqf.r + row;
+                    let byte = *block.add(weights_offset + ci / 4);
+                    let code = (byte >> (2 * (ci % 4))) & 0x3;
+                    *target.next().unwrap() = scale * (code as i8 - 1).as_();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const QK: usize> BlockQuant for BaseQ1_58<QK> {
+    fn block_len(&self) -> usize {
+        QK
+    }
+
+    fn block_bytes(&self) -> usize {
+        // one f16 scale + QK 2-bit codes (four per byte)
+        2 + self.block_len() / 4
+    }
+
+    fn quant_block_f32(&self, block: &[f32], quant: &mut [u8]) {
+        self.quant_block(block, quant)
+    }
+
+    fn quant_block_f16(&self, block: &[f16], quant: &mut [u8]) {
+        self.quant_block(block, quant)
+    }
+
+    fn dequant_block_f32(&self, quant: &[u8], block: &mut [f32]) {
+        self.dequant_block(quant, block)
+    }
+
+    fn dequant_block_f16(&self, quant: &[u8], block: &mut [f16]) {
+        self.dequant_block(quant, block)
+    }
+
+    // s0_0 c0_0 c0_1 .. c0_31 s0_32 c0_32 ..        (per row: f16 scale + QK packed crumbs)
+    // s1_0 c1_0 c1_1 .. c1_31 s1_32 c1_32 ..
+    //
+    //  becomes (with r=4, scales-first)
+    //
+    //  s0_0 s1_0 s2_0 s3_0  [c0_0 c1_0 c2_0 c3_0  c0_1 c1_1 c2_1 c3_1 ...]  (codes packed 4/byte)
+    //  s0_32 s1_32 s2_32 s3_32  [c0_0 c1_0 c2_0 c3_0 ...]
+    fn pack(
+        &self,
+        input: &[u8],
+        k: usize,
+        r: usize,
+        zip: usize,
+        scales_at_end: bool,
+    ) -> TractResult<EagerPackedInput> {
+        ensure!(input.len() % self.block_bytes() == 0);
+        ensure!(k % self.block_len() == 0);
+        ensure!(zip == 0, "No zipping required for Q1_58");
+        let m = if input.len() == 0 {
+            0
+        } else {
+            input.len() / self.block_bytes() * self.block_len() / k
+        };
+        let panels = m.divceil(r);
+        let blocks_for_k = k / self.block_len();
+        let row_bytes = blocks_for_k * self.block_bytes();
+        let panel_bytes = row_bytes * r;
+        let mut blob =
+            unsafe { Blob::for_layout(Layout::from_size_align(panel_bytes * panels, 128)?) };
+        let mut writer = CrumbWriter::for_slice(&mut blob);
+        let mut scales = vec![f16::zero(); r];
+        for p in 0..panels {
+            let input = &input[(r * p) * row_bytes..];
+            let mut readers = (0..r)
+                .map(|r| {
+                    // manage partial panel
+                    let offset = if r * row_bytes < input.len() { r * row_bytes } else { 0 };
+                    CrumbReader::for_slice(&input[offset..])
+                })
+                .collect_vec();
+            let mut temp_codes = vec![vec![0u8; self.block_len()]; r];
+            for _ in 0..blocks_for_k {
+                for (row, reader) in readers.iter_mut().enumerate() {
+                    scales[row] = reader.read_f16();
+                    temp_codes[row] =
+                        (0..self.block_len()).map(|_| reader.read_crumb()).collect_vec();
+                }
+                if !scales_at_end {
+                    scales.iter().for_each(|s| writer.write_f16(*s))
+                }
+                for pos in 0..self.block_len() {
+                    for row in &temp_codes {
+                        writer.write_crumb(row[pos]);
+                    }
+                }
+                if scales_at_end {
+                    scales.iter().for_each(|s| writer.write_f16(*s))
+                }
+            }
+        }
+        Ok(EagerPackedInput {
+            fact: PackedExoticFact {
+                format: Box::new(PackedBlockQuantFormat {
+                    bq: Box::new(*self),
+                    r,
+                    zip,
+                    scales_at_end,
+                }),
+                mn: m.to_dim(),
+                k,
+            },
+            packed: blob.into(),
+            panel_bytes,
+            mn: m,
+        })
+    }
+
+    unsafe fn extract_packed_panel(
+        &self,
+        value: &EagerPackedInput,
+        target: &PackedFormat,
+        panel: usize,
+        scratch: *mut u8,
+    ) -> TractResult<()> {
+        unsafe {
+            dispatch_floatlike!(Self::extract_panel_t(target.dt)(
+                self, value, target, panel, scratch
+            ))
+        }
+    }
+
+    fn extract_at_mn_f16(
+        &self,
+        value: &EagerPackedInput,
+        mn: usize,
+        target: &mut [f16],
+    ) -> TractResult<()> {
+        self.extract_at_mn_t(value, mn, target)
+    }
+
+    fn extract_at_mn_f32(
+        &self,
+        value: &EagerPackedInput,
+        mn: usize,
+        target: &mut [f32],
+    ) -> TractResult<()> {
+        self.extract_at_mn_t(value, mn, target)
+    }
+}
+
+impl<const QK: usize> Display for BaseQ1_58<QK> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Q1_58")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tract_data::internal::tract_ndarray::Array2;
+
+    use crate::pack::PackedFormat;
+
+    use super::*;
+
+    // Ternary data the format reproduces exactly: a *full* block whose non-zero entries
+    // all share one magnitude (so abs-mean == that magnitude and round(w/scale) lands on
+    // {-1, +1}). Padding with zeros would shift the abs-mean, so we fill whole blocks.
+    fn test_loop_exact_f32(b: impl BlockQuant, data: &[f32]) {
+        assert!(data.len() % b.block_len() == 0);
+        let quant = b.quant_f32(data).unwrap();
+        let result = b.dequant_f32(&quant).unwrap();
+        let view = result.try_as_plain().unwrap().as_slice::<f32>().unwrap();
+        assert_eq!(data, view);
+    }
+
+    fn test_loop_exact_f16(b: impl BlockQuant, data: &[f32]) {
+        assert!(data.len() % b.block_len() == 0);
+        let input = data.iter().map(|f| f16::from_f32(*f)).collect_vec();
+        let quant = b.quant_f16(&input).unwrap();
+        let result = b.dequant_f16(&quant).unwrap();
+        let view = result.try_as_plain().unwrap().as_slice::<f16>().unwrap();
+        assert_eq!(&input, view);
+    }
+
+    // a full 32-block of alternating +/-2
+    fn alt_block(mag: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| if i % 2 == 0 { mag } else { -mag }).collect()
+    }
+
+    #[test]
+    fn loop_q1_58_f32_alt() {
+        test_loop_exact_f32(Q1_58, &alt_block(2.0, 32));
+    }
+
+    #[test]
+    fn loop_q1_58_f16_alt() {
+        test_loop_exact_f16(Q1_58, &alt_block(2.0, 32));
+    }
+
+    #[test]
+    fn loop_q1_58_f32_zeros() {
+        test_loop_exact_f32(Q1_58, &vec![0.0; 32]);
+    }
+
+    #[test]
+    fn loop_q1_58_small_block() {
+        test_loop_exact_f32(BaseQ1_58::<4>, &[5.0, -5.0, 5.0, 5.0]);
+    }
+
+    // abs-mean reconstruction on a known mixed block (block_len 4, no padding).
+    #[test]
+    fn quant_absmean_known() {
+        let q = BaseQ1_58::<4>;
+        // block of 4: |.| mean = (3+1+0+2)/4 = 1.5 ; round(w/1.5) -> codes
+        let data = [3.0f32, -1.0, 0.0, -2.0];
+        let quant = q.quant_f32(&data).unwrap();
+        let deq = q.dequant_f32(&quant).unwrap();
+        let got = deq.try_as_plain().unwrap().as_slice::<f32>().unwrap().to_vec();
+        // scale = 1.5 ; codes: round(3/1.5)=2->clamp 1 ; round(-1/1.5)=-1 ; 0 ; round(-2/1.5)=-1
+        assert_eq!(got, vec![1.5, -1.5, 0.0, -1.5]);
+    }
+
+    fn test_pack_then_extract_panel(
+        q: impl BlockQuant,
+        k: usize,
+        m: usize,
+        r: usize,
+        scales_at_end: bool,
+    ) -> TractResult<()> {
+        let weights_orig =
+            Array2::from_shape_fn((m, k), |(m, k)| ((m * 31 + k * 17) % 7) as f32 - 3.)
+                .into_tensor();
+        // abs-mean ternary quant is not idempotent, so derive both the f32 reference and
+        // the packed form from a *single* quantization `qt`.
+        let qt = q.quant_f32(weights_orig.try_as_plain()?.as_slice::<f32>()?)?;
+        let weights_f32 = q.dequant_f32(&qt)?.into_shape(&[m, k])?;
+        let packer = PackedFormat::new(f32::datum_type(), r, 128);
+        let packed_f32 = packer.pack_tensor(&weights_f32, 1, 0)?;
+
+        let packed_qt = q.pack(&qt, k, r, 0, scales_at_end)?;
+
+        for panel in 0..packed_f32.panels_count() {
+            unsafe {
+                let panel_f32 = packed_f32.panel_bytes(panel, None)?;
+                let panel_f32 = std::slice::from_raw_parts(panel_f32 as *const f32, k * r);
+                let mut panel_qt = Tensor::zero::<f32>(&[k * r])?;
+                q.extract_packed_panel(
+                    &packed_qt,
+                    &packer,
+                    panel,
+                    panel_qt.as_bytes_mut().as_mut_ptr(),
+                )?;
+                assert_eq!(panel_qt.try_as_plain()?.as_slice::<f32>()?, panel_f32);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pack_then_extract_panel() -> TractResult<()> {
+        test_pack_then_extract_panel(BaseQ1_58::<4>, 8, 4, 2, false)
+    }
+
+    #[test]
+    fn pack_then_extract_panel_with_scales_at_end() -> TractResult<()> {
+        test_pack_then_extract_panel(BaseQ1_58::<4>, 8, 4, 4, true)
+    }
+
+    #[test]
+    fn pack_then_extract_panel_r8() -> TractResult<()> {
+        test_pack_then_extract_panel(BaseQ1_58::<8>, 16, 8, 8, false)
+    }
+
+    fn test_pack_then_extract_row(
+        q: impl BlockQuant,
+        k: usize,
+        m: usize,
+        r: usize,
+        scales_at_end: bool,
+    ) -> TractResult<()> {
+        let weights_orig =
+            Array2::from_shape_fn((m, k), |(m, k)| ((m * 31 + k * 17) % 7) as f32 - 3.)
+                .into_tensor();
+        let qt = q.quant_f32(weights_orig.try_as_plain()?.as_slice::<f32>()?)?;
+        let weights_f32 = q.dequant_f32(&qt)?.into_shape(&[m, k])?;
+        let packer = PackedFormat::new(f32::datum_type(), r, 128);
+        let packed_f32 = packer.pack_tensor(&weights_f32, 1, 0)?;
+
+        let packed_qt = q.pack(&qt, k, r, 0, scales_at_end)?;
+
+        for row in 0..packed_f32.mn() {
+            unsafe {
+                let panel_f32 = packed_f32.panel_bytes(row / r, None)?;
+                let panel_f32 = std::slice::from_raw_parts(panel_f32 as *const f32, k * r);
+                let row_f32 = (0..k).map(|ix| panel_f32[row % r + r * ix]).collect_vec();
+
+                let mut qt = vec![0f32; k];
+                q.extract_at_mn_f32(&packed_qt, row, &mut qt)?;
+                assert_eq!(qt, row_f32);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pack_then_extract_row() -> TractResult<()> {
+        test_pack_then_extract_row(BaseQ1_58::<4>, 8, 4, 2, false)
+    }
+
+    #[test]
+    fn pack_then_extract_row_with_scales_at_end() -> TractResult<()> {
+        test_pack_then_extract_row(BaseQ1_58::<4>, 8, 4, 4, true)
+    }
+
+    // ---- Phase B: integer (int8 x int8 -> i32) dot reproduces the f32 dequant path ----
+
+    /// Per-tensor symmetric int8 activation quantization (max-abs), the BitNet b1.58 recipe.
+    fn quant_activations_i8(x: &[f32]) -> (Vec<i8>, f32) {
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        let r = if scale == 0.0 { 0.0 } else { scale.recip() };
+        (x.iter().map(|v| (v * r).round().clamp(-127., 127.) as i8).collect(), scale)
+    }
+
+    /// GEMV y[M] = W[M,K] . x[K], with W ternary-quantized (per-block f16 scale) and x
+    /// int8-quantized (one tensor scale). The dot is done as i8xi8 -> i32 accumulation
+    /// per block; the block weight-scale and the activation-scale are applied in the
+    /// epilogue. Compares against the f32 dequant-then-matmul reference.
+    #[test]
+    fn phase_b_integer_gemv_matches_f32() -> TractResult<()> {
+        let q = BaseQ1_58::<32>;
+        let (m, k) = (6usize, 96usize);
+        let bl = q.block_len();
+        let blocks_for_k = k / bl;
+
+        let weights =
+            Array2::from_shape_fn((m, k), |(i, j)| (((i * 7 + j * 13) % 11) as f32 - 5.0) * 0.5);
+        let x: Vec<f32> = (0..k).map(|j| ((j % 9) as f32 - 4.0) * 0.25).collect();
+
+        // f32 reference: dequantize weights blockwise, plain matmul.
+        let mut ref_y = vec![0f32; m];
+        let mut block_q = vec![0u8; q.block_bytes()];
+        let mut block_deq = vec![0f32; bl];
+        for i in 0..m {
+            let mut acc = 0f32;
+            for b in 0..blocks_for_k {
+                let row_block = &weights.as_slice().unwrap()[i * k + b * bl..][..bl];
+                q.quant_block_f32(row_block, &mut block_q);
+                q.dequant_block_f32(&block_q, &mut block_deq);
+                for j in 0..bl {
+                    acc += block_deq[j] * x[b * bl + j];
+                }
+            }
+            ref_y[i] = acc;
+        }
+
+        // integer path: ternary codes (i8) x int8 activations -> i32, scaled per block.
+        let (x_i8, x_scale) = quant_activations_i8(&x);
+        let mut int_y = vec![0f32; m];
+        let mut codes = vec![0i8; bl];
+        for i in 0..m {
+            let mut acc_f = 0f32;
+            for b in 0..blocks_for_k {
+                let row_block = &weights.as_slice().unwrap()[i * k + b * bl..][..bl];
+                q.quant_block_f32(row_block, &mut block_q);
+                let w_scale = q.dequant_block_i8(&block_q, &mut codes).to_f32();
+                let mut acc_i32: i32 = 0;
+                for j in 0..bl {
+                    acc_i32 += codes[j] as i32 * x_i8[b * bl + j] as i32;
+                }
+                acc_f += acc_i32 as f32 * w_scale * x_scale;
+            }
+            int_y[i] = acc_f;
+        }
+
+        // The integer path differs from the f32 reference only by the activation int8
+        // rounding (weights are bit-identical between the two paths).
+        for i in 0..m {
+            let err = (int_y[i] - ref_y[i]).abs();
+            assert!(
+                err <= 0.02 * ref_y[i].abs().max(1.0),
+                "row {i}: int8={} f32={} err={}",
+                int_y[i],
+                ref_y[i],
+                err
+            );
+        }
+        Ok(())
+    }
+}
