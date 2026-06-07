@@ -281,39 +281,69 @@ Where it does **not** help: prefill-heavy / large-batch with Tier A; CNN/vision
 
 ## Implementation status (this branch)
 
-Phases A and B are implemented in `linalg/src/frame/block_quant/`:
+Implemented and tested (full `tract-linalg` lib suite green: **2762 passed**).
 
-- **`q1_58.rs`** — `Q1_58` / `BaseQ1_58<QK>`, a `BlockQuant` storing ternary `{-1,0,+1}`
-  as 2-bit codes (4/byte) + one f16 abs-mean scale/block. **2.5 bits/weight at QK=32**.
-  Implements the full trait (quant/dequant, `pack`, `extract_packed_panel`,
-  `extract_at_mn_*`), so it plugs into the existing dequant-to-f16 mmm path (Tier A) with
-  no kernel change.
-- **`helpers.rs`** — `CrumbReader`/`CrumbWriter` (2-bit packing), mirroring the nibble pair.
-- **Phase B** — `dequant_block_i8` emits raw ternary codes for an int8×int8→i32 dot;
-  `phase_b_integer_gemv_matches_f32` verifies that integer path reproduces the f32 dequant
-  GEMV within activation-quant tolerance. Routing it to the VNNI/AMX/SDOT i32 kernels is
-  the remaining (cross-PR) wiring.
-- **Tests**: 11 new (round-trip, abs-mean, pack/extract panel+row, integer GEMV); full
-  `tract-linalg` lib suite green (2620 + 11).
+**Tier A — ternary `Q1_58` format, wired end-to-end:**
+- **`block_quant/q1_58.rs`** — `Q1_58` / `BaseQ1_58<QK>`, a `BlockQuant` storing ternary
+  `{-1,0,+1}` as 2-bit codes (4/byte) + one f16 abs-mean scale/block. **2.5 bits/weight at
+  QK=32**. Full trait (quant/dequant, `pack`, `extract_packed_panel`, `extract_at_mn_*`).
+- **`block_quant/helpers.rs`** — `CrumbReader`/`CrumbWriter` (2-bit packing).
+- **`generic/mmm.rs`** — registered as first-class kernel packings `q1_58f16`/`q1_58f32`
+  on the generic f16/f32 4×4 and 4×1 kernels + inline `add_mat_mul_pq1_58` handler (the
+  crumb analog of `add_mat_mul_pq40`). The `MMMRustKernel!` macro auto-generates the
+  packed-packed correctness suite for each packing → **128 end-to-end matmuls vs the f32
+  reference, all green**.
+- **`x86_64_fma/panel_extract.rs`** — `(1) SIMD unpack`: AVX2 `packed_32_q1_58_to_f32`
+  extractor (zip=0, r=32) using `vpsrlvd` per-lane shifts to pull each row's 2-bit code,
+  then `(code-1)*scale`. `panel_extractor!` auto-generates 6 correctness tests vs the
+  scalar reference (all green). This is the extractor the core optimizer wraps a Q1_58
+  weight in (`PanelExtractInput`) to feed a plain f32 kernel — the analog of
+  `packed_32_q40_to_f32`.
 
-### First measurement (this box: 4-core Xeon, 33 MB L3), `measure_unpack`
+**Phase B / Tier B — integer path:** `dequant_block_i8` emits raw ternary codes for an
+int8×int8→i32 dot; `phase_b_integer_gemv_matches_f32` verifies that path reproduces the
+f32 dequant GEMV within activation-quant tolerance. **Full production wiring is not done
+here** and is genuinely blocked on two things: (a) the VNNI/AMX int8 kernels live in the
+fork's PR #3/#14/#15 branches, not on this branch (which has only AVX2/generic i32); and
+(b) a clean integer path wants a **per-row** scale (BitNet style) rather than this format's
+**per-block** scale, because the i32 kernel accumulates over all K before one rescale.
+That is a deliberate format variant + kernel-epilogue change, documented as the next step.
 
-| format | packed (4096×4096) | bits/weight |
-|--------|--------------------|-------------|
-| Q1_58  | **5.24 MB**        | 2.5         |
-| Q4_0   | 9.44 MB            | 4.5         |
-| Q8_1   | 18.87 MB           | 9.0         |
+### Measurements (this box: 4-core Xeon, AVX-512/VNNI, 33 MB L3)
 
-The **footprint win is real and unconditional** — Q1_58 is 1.8× smaller than Q4_0 and 3.6×
-smaller than Q8_1 (and ~6.4× vs f16), exactly as predicted. But the *unpack-throughput*
-part of the same microbench is **compute-bound on the scalar bit-unpack** and the buffers
-fit in this box's 33 MB L3, so it does **not** show the bandwidth/speed win — byte-aligned
-Q8_1 even unpacks faster per byte than the bit-packed formats. This is the dequant-tax
-caveat from the roofline made concrete: **the Tier-A speed win needs (a) a real
-DRAM-bound decode GEMV (weights > LLC) and (b) a vectorized unpack** — or the Tier-B
-integer path that skips the f16 expansion entirely. Net: ship A for the guaranteed memory
-win now; the latency win wants a SIMD unpack kernel and/or Tier-B routing, and a
-decode-shaped end-to-end bench to measure.
+**Footprint (`measure_unpack`) — unconditional win:**
+
+| format | packed 4096×4096 | bits/weight |
+|--------|------------------|-------------|
+| Q1_58  | **5.24 MB**      | 2.5         |
+| Q4_0   | 9.44 MB          | 4.5         |
+| Q8_1   | 18.87 MB         | 9.0         |
+
+**SIMD unpack (`measure_simd_unpack`) — the (1) payoff:** unpacking the 5.2 MB Q1_58
+panel set to f32: scalar `extract_packed_panel` **25.4 ms** vs AVX2 `packed_32_q1_58_to_f32`
+**2.84 ms = 8.9× faster**. The bit-unpack tax is exactly what the SIMD extractor removes.
+
+**Decode GEMV (`measure_decode_gemv`) — the honest end-to-end picture:** N=1, weights > L3,
+through the *generic scalar* kernel:
+
+| | weights | ms/token |
+|--|---------|----------|
+| f32   | 537 MB | 67  (DRAM-bandwidth-bound at ~8 GB/s) |
+| Q4_0  | 75 MB  | 122 (scalar nibble-unpack bound) |
+| Q1_58 | 42 MB  | 146 (scalar crumb-unpack bound) |
+
+Read together these tell the whole story: f32 GEMV is **bandwidth-bound**, so the 7–13×
+smaller quantized weights *should* win — but on the **scalar** kernel the bit-unpack tax
+more than erases it (quant formats end up slower). The SIMD extractor cuts that tax 8.9×,
+which is precisely the bridge from "smaller but slower" to "smaller and faster". The
+remaining step to realize it end-to-end is to route Q1_58 through an x86 f32 kernel via the
+`PanelExtractInput`/optimizer path (core-level), or add `q1_58` asm to the in-kernel
+`fma_mmm_f32_32x1` path the way `q40` is baked in.
+
+**Net:** Tier A's memory win is delivered and unconditional; the latency win is now
+*mechanically in place* (validated SIMD extractor, 8.9× over scalar) and needs the
+core-optimizer routing to a fast f32 kernel (and/or the Tier-B integer path) to show up in
+an end-to-end decode bench.
 
 ## Fit with the open fork PRs (no clash; strong synergy)
 
