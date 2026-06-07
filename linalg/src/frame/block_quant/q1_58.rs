@@ -626,6 +626,92 @@ mod tests {
         Ok(())
     }
 
+    // Quantifies the SIMD unpack win: scalar `extract_packed_panel` vs the AVX2
+    // `packed_32_q1_58_to_f32` extractor, both turning a Q1_58 r=32 panel into an f32
+    // panel. This is the step that dominated the scalar decode GEMV.
+    //
+    //   cargo test -p tract-linalg --lib block_quant::q1_58::tests::measure_simd_unpack \
+    //       --release -- --ignored --nocapture
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore]
+    fn measure_simd_unpack() -> TractResult<()> {
+        use crate::pack::PackedFormat;
+        use std::time::Instant;
+
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("f16c") {
+            println!("avx2/f16c not available, skipping");
+            return Ok(());
+        }
+        let q = BaseQ1_58::<32>;
+        let (m, k) = (4096usize, 4096usize);
+        let weights: Vec<f32> = (0..m * k).map(|i| ((i * 2654435761) % 7) as f32 - 3.0).collect();
+        let quant = q.quant_f32(&weights)?;
+        let packed = q.pack(&quant, k, 32, 0, false)?;
+        let panels = m / 32;
+        let mut scratch = vec![0f32; k * 32];
+        let packer = PackedFormat::new(f32::datum_type(), 32, 32);
+        let simd = crate::x86_64_fma::panel_extract::packed_32_q1_58_to_f32.kernel;
+
+        let bytes = packed.packed.len() as f64;
+        let iters = 50;
+        // scalar
+        for _ in 0..2 {
+            for p in 0..panels {
+                unsafe {
+                    q.extract_packed_panel(&packed, &packer, p, scratch.as_mut_ptr() as *mut u8)?;
+                }
+            }
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            for p in 0..panels {
+                unsafe {
+                    q.extract_packed_panel(&packed, &packer, p, scratch.as_mut_ptr() as *mut u8)?;
+                }
+            }
+        }
+        let scalar = t.elapsed().as_secs_f64() / iters as f64;
+        // simd
+        for _ in 0..2 {
+            for p in 0..panels {
+                unsafe {
+                    simd(
+                        packed.packed.as_ptr().add(p * packed.panel_bytes),
+                        scratch.as_mut_ptr() as *mut u8,
+                        k,
+                    );
+                }
+            }
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            for p in 0..panels {
+                unsafe {
+                    simd(
+                        packed.packed.as_ptr().add(p * packed.panel_bytes),
+                        scratch.as_mut_ptr() as *mut u8,
+                        k,
+                    );
+                }
+            }
+        }
+        let simd_s = t.elapsed().as_secs_f64() / iters as f64;
+        println!("--- Q1_58 unpack {m}x{k} ({:.1} MB packed) ---", bytes / 1e6);
+        println!(
+            "scalar extract_packed_panel: {:6.0} us, {:.1} GB/s",
+            scalar * 1e6,
+            bytes / scalar / 1e9
+        );
+        println!(
+            "AVX2  packed_32_q1_58_to_f32: {:6.0} us, {:.1} GB/s ({:.1}x faster)",
+            simd_s * 1e6,
+            bytes / simd_s / 1e9,
+            scalar / simd_s
+        );
+        Ok(())
+    }
+
     // Decode-shaped (N=1) end-to-end GEMV through the *real* generic mmm kernel, weights
     // sized to exceed this box's L3, comparing plain f32 weights vs Q4_0 vs Q1_58. This is
     // the honest end-to-end Tier-A measurement (kernel compute + weight streaming together).
