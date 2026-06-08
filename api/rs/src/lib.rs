@@ -39,7 +39,7 @@ pub mod prelude {
 
     // User-facing API types
     pub use tract_api::{
-        ConcretizeSymbols, Datum, DatumType, FloatPrecision, Pulse, TransformSpec, tensor,
+        Datum, DatumType, FloatPrecision, Pulse, SetSymbols, TransformSpec, tensor,
     };
 
     // Traits needed for method resolution — hidden from namespace
@@ -345,7 +345,10 @@ impl RunnableInterface for Runnable {
     type Fact = Fact;
 
     fn run(&self, inputs: impl IntoInputs<Tensor>) -> Result<Vec<Tensor>> {
-        StateInterface::run(&mut self.spawn_state()?, inputs.into_inputs()?)
+        let inputs: TVec<TValue> =
+            inputs.into_inputs()?.into_iter().map(|v| v.0.into_tvalue()).collect();
+        let outputs = self.0.run(inputs)?;
+        Ok(outputs.into_iter().map(|t| Tensor(t.into_arc_tensor())).collect())
     }
 
     fn spawn_state(&self) -> Result<State> {

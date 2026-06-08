@@ -51,7 +51,7 @@ jobs:
       contents: read
     needs: prepare
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -59,7 +59,7 @@ jobs:
 
     - name: Configure AWS Credentials
       continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
+      uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
       with:
         role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
         aws-region: us-east-2
@@ -72,7 +72,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -90,7 +90,7 @@ jobs:
         opset: [1_4_1, 1_5_0, 1_6_0, 1_7_0, 1_8_1, 1_9_0, 1_10_2, 1_11_0, 1_12_0, 1_13_0, 1_14_1, 1_15_0, 1_16_2, 1_17_0, 1_18_0, 1_19_1]
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -103,7 +103,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -116,7 +116,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -132,7 +132,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -147,7 +147,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -162,7 +162,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -177,7 +177,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
@@ -193,7 +193,7 @@ jobs:
     needs: prepare
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare.outputs.test_ref }}
         fetch-depth: 0
