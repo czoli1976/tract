@@ -54,9 +54,11 @@ macro_rules! register_metal_op {
     };
 }
 
-/// Metal-local SDPA flattening: explode only the `Sdpa` nodes the MFA kernel
-/// can't fuse, leaving fusable ones for the `MetalMfaSdpa` translator. (The
-/// shared `tract_gpu` `rewire_sdpa` explodes all of them; cuda still uses it.)
+/// Metal-local SDPA flattening: explode only the `Sdpa` nodes neither fused
+/// kernel can take (MLX port first, vendored MFA metallib second), leaving
+/// fusable ones for the chooser translator in `kernels::matmul::mlx_sdpa`.
+/// (The shared `tract_gpu` `rewire_sdpa` explodes all of them; cuda still
+/// uses it.)
 fn flatten_unfused_sdpa(
     _ctx: &(),
     model: &TypedModel,
@@ -65,8 +67,10 @@ fn flatten_unfused_sdpa(
     op: &tract_transformers::ops::sdpa::Sdpa,
 ) -> TractResult<Option<TypedModelPatch>> {
     let in_facts = model.node_input_facts(node.id)?;
-    if crate::kernels::matmul::mfa::mfa_sdpa_supported(op, &in_facts) {
-        Ok(None) // leave intact for the MetalMfaSdpa translator
+    if crate::kernels::matmul::mlx_sdpa::mlx_sdpa_supported(op, &in_facts)
+        || crate::kernels::matmul::mfa::mfa_sdpa_supported(op, &in_facts)
+    {
+        Ok(None) // leave intact for the fused-Sdpa translator
     } else {
         op.patch_sdpa(model, node) // explode (same as the shared rewire_sdpa)
     }

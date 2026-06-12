@@ -252,11 +252,12 @@ mod tests {
     }
 
     // Slice C e2e: a real `Sdpa` op routes to MetalMfaSdpa via the metal transform
-    // and matches the CPU explode path.
+    // and matches the CPU explode path. D=32 is outside the MLX port's head-dim
+    // sets, so the chooser falls through to the MFA metallib (D%8, equal heads).
     #[test]
     fn sdpa_routes_to_mfa_and_matches_cpu() -> TractResult<()> {
         use crate::kernels::matmul::mfa::MetalMfaSdpa;
-        let (h, s, d) = (4usize, 32usize, 64usize); // B=1, D%8 -> fusable
+        let (h, s, d) = (4usize, 32usize, 32usize); // B=1, D%8, not an MLX dim -> MFA
         let fact = f32::fact(tvec![
             TDim::from(1i64),
             TDim::from(h as i64),
@@ -305,11 +306,11 @@ mod tests {
         Ok(())
     }
 
-    // GQA (H_kv < H_q) predates the MFA kernel: the translator must decline and
-    // the explode fallback must still match the CPU reference.
+    // GQA at an MLX-supported head dim routes to the MLX port (native
+    // gqa_factor) and matches the CPU reference.
     #[test]
-    fn gqa_sdpa_declines_mfa_and_matches_cpu() -> TractResult<()> {
-        use crate::kernels::matmul::mfa::MetalMfaSdpa;
+    fn gqa_sdpa_routes_to_mlx_and_matches_cpu() -> TractResult<()> {
+        use crate::kernels::matmul::mlx_sdpa::MetalMlxSdpa;
         let (hq, hkv, s, d) = (4usize, 2usize, 32usize, 64usize);
         let fact = |h: usize| {
             f32::fact(tvec![
@@ -349,8 +350,65 @@ mod tests {
 
         let metal = MetalTransform::default().transform_into(model)?;
         assert!(
-            !metal.nodes().iter().any(|n| n.op_is::<MetalMfaSdpa>()),
-            "GQA Sdpa must not route to MetalMfaSdpa"
+            metal.nodes().iter().any(|n| n.op_is::<MetalMlxSdpa>()),
+            "GQA Sdpa at D=64 should route to MetalMlxSdpa"
+        );
+
+        let metal_out = metal.into_runnable()?.run(tvec![qt, kt, vt])?;
+        cpu_out[0]
+            .clone()
+            .into_tensor()
+            .close_enough(&metal_out[0].clone().into_tensor(), Approximation::Approximate)?;
+        Ok(())
+    }
+
+    // GQA at a head dim neither fused kernel supports (48: not an MLX dim, and
+    // the MFA kernel predates GQA) must explode and still match CPU.
+    #[test]
+    fn gqa_sdpa_declines_fusion_and_matches_cpu() -> TractResult<()> {
+        use crate::kernels::matmul::mfa::MetalMfaSdpa;
+        use crate::kernels::matmul::mlx_sdpa::MetalMlxSdpa;
+        let (hq, hkv, s, d) = (4usize, 2usize, 32usize, 48usize);
+        let fact = |h: usize| {
+            f32::fact(tvec![
+                TDim::from(1i64),
+                TDim::from(h as i64),
+                TDim::from(s as i64),
+                TDim::from(d as i64)
+            ])
+        };
+        let mut model = TypedModel::default();
+        let q = model.add_source("q", fact(hq))?;
+        let k = model.add_source("k", fact(hkv))?;
+        let v = model.add_source("v", fact(hkv))?;
+        let out = model.wire_node(
+            "sdpa",
+            tract_transformers::ops::sdpa::Sdpa {
+                scale: None,
+                datum_type: f32::datum_type(),
+                acc_datum_type: f32::datum_type(),
+                is_causal: false,
+            },
+            &[q, k, v],
+        )?;
+        model.select_output_outlets(&out)?;
+
+        let mk = |h: usize, seed: i64| -> TractResult<TValue> {
+            let n = h * s * d;
+            let data: Vec<f32> = (0..n)
+                .map(|i| (((i as i64 * 2654435761 + seed).rem_euclid(1000)) as f32 / 1000.0) - 0.5)
+                .collect();
+            Ok(Tensor::from_shape(&[1, h, s, d], &data)?.into_tvalue())
+        };
+        let (qt, kt, vt) = (mk(hq, 1)?, mk(hkv, 2)?, mk(hkv, 3)?);
+
+        let cpu = model.clone().into_runnable()?;
+        let cpu_out = cpu.run(tvec![qt.clone(), kt.clone(), vt.clone()])?;
+
+        let metal = MetalTransform::default().transform_into(model)?;
+        assert!(
+            !metal.nodes().iter().any(|n| n.op_is::<MetalMfaSdpa>() || n.op_is::<MetalMlxSdpa>()),
+            "GQA Sdpa at D=48 must not fuse"
         );
 
         let metal_out = metal.into_runnable()?.run(tvec![qt, kt, vt])?;
@@ -397,14 +455,14 @@ mod tests {
         };
         let fused_m = mk(false)?;
         let explode_m = mk(true)?;
-        assert!(
-            fused_m.nodes().iter().any(|n| n.op_is::<MetalMfaSdpa>()),
-            "3-input Sdpa should fuse to MetalMfaSdpa"
-        );
-        assert!(
-            !explode_m.nodes().iter().any(|n| n.op_is::<MetalMfaSdpa>()),
-            "4-input Sdpa should take the explode path"
-        );
+        let is_fused = |m: &TypedModel| {
+            m.nodes().iter().any(|n| {
+                n.op_is::<MetalMfaSdpa>()
+                    || n.op_is::<crate::kernels::matmul::mlx_sdpa::MetalMlxSdpa>()
+            })
+        };
+        assert!(is_fused(&fused_m), "3-input Sdpa should fuse");
+        assert!(!is_fused(&explode_m), "4-input Sdpa should take the explode path");
         let fused = fused_m.into_runnable()?;
         let explode = explode_m.into_runnable()?;
         let z =
@@ -485,9 +543,12 @@ mod tests {
         };
         let fused_m = mk(false)?;
         let explode_m = mk(true)?;
-        let n_fused = fused_m.nodes().iter().filter(|x| x.op_is::<MetalMfaSdpa>()).count();
+        let is_fused = |x: &&TypedNode| {
+            x.op_is::<MetalMfaSdpa>() || x.op_is::<crate::kernels::matmul::mlx_sdpa::MetalMlxSdpa>()
+        };
+        let n_fused = fused_m.nodes().iter().filter(is_fused).count();
         assert_eq!(n_fused, n, "all {n} layers should fuse");
-        assert_eq!(explode_m.nodes().iter().filter(|x| x.op_is::<MetalMfaSdpa>()).count(), 0);
+        assert_eq!(explode_m.nodes().iter().filter(is_fused).count(), 0);
         let fused = fused_m.into_runnable()?;
         let explode = explode_m.into_runnable()?;
         let z =
