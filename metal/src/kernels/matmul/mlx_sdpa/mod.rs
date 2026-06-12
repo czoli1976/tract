@@ -201,7 +201,9 @@ fn dispatch_sdpa_vector_2pass(
 }
 
 /// Steel tiled prefill kernel: 4 simdgroups per threadgroup, one threadgroup
-/// per (q block, q head, batch). Grid mirrors mlx cpp:160.
+/// per (q block, q head, batch). Grid mirrors mlx cpp:160. With `nax` the
+/// Metal-4 tensor-op variant is dispatched instead (same ABI, bq64/bk32
+/// tiles, separate library so it only compiles when the gate probes ok).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_steel_attention(
     stream: &MetalStream,
@@ -213,8 +215,13 @@ fn dispatch_steel_attention(
     k: &DeviceTensor,
     v: &DeviceTensor,
     out: &DeviceTensor,
+    nax: bool,
 ) -> TractResult<()> {
-    let (bq, bk) = (32usize, if d < 128 { 32usize } else { 16usize });
+    let (lib, bq, bk) = if nax {
+        (LibraryName::MlxSdpaNax, 64usize, 32usize)
+    } else {
+        (LibraryName::MlxSdpa, 32usize, if d < 128 { 32usize } else { 16usize })
+    };
     let tname = steel_tname(dt)?;
     let name = format!("steel_attention_{tname}_bq{bq}_bk{bk}_bd{d}_wm4_wn1_mask{tname}");
     let constants = Some(ConstantValues::new(vec![
@@ -224,7 +231,7 @@ fn dispatch_steel_attention(
         (301, Value::Bool(do_causal)),    // do_causal
         (302, Value::Bool(false)),        // has_sinks
     ]));
-    let pipeline = stream.load_pipeline_with_constants(LibraryName::MlxSdpa, &name, constants)?;
+    let pipeline = stream.load_pipeline_with_constants(lib, &name, constants)?;
 
     let nq = ql.div_ceil(bq);
     let nk = kl.div_ceil(bk);
@@ -311,8 +318,100 @@ pub fn dispatch_mlx_sdpa(
             "MLX SDPA: no kernel for head dim {d} with query len {ql} (translator gate too wide?)"
         );
         ensure!(!is_causal || ql <= kl, "causal SDPA needs qL <= kL, got {ql} > {kl}");
-        dispatch_steel_attention(stream, dt, scale, is_causal, shape6, q, k, v, out)
+        // M5-class GPUs take the Metal-4 tensor-op variant (f32 only behind
+        // TRACT_METAL_SDPA_TF32=1: the accelerators compute f32 as tf32, a
+        // precision change mlx defaults to but tract should opt into).
+        let nax = NAX_STEEL_DIMS.contains(&d)
+            && (dt == DatumType::F16
+                || std::env::var("TRACT_METAL_SDPA_TF32").as_deref() == Ok("1"))
+            && nax_runtime_available();
+        dispatch_steel_attention(stream, dt, scale, is_causal, shape6, q, k, v, out, nax)
     }
+}
+
+/// Head dims with NAX (Metal-4 tensor-op) instantiations; 80 is excluded
+/// upstream too (mlx cpp:178).
+const NAX_STEEL_DIMS: &[usize] = &[64, 128];
+
+/// Whether the NAX library compiles on this OS/driver (needs the macOS 26+
+/// runtime Metal compiler for MetalPerformancePrimitives). Cached; failure is
+/// the expected path on older systems.
+fn nax_library_compiles() -> bool {
+    static COMPILES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COMPILES.get_or_init(|| {
+        crate::with_metal_stream(|stream| Ok(stream.load_library(LibraryName::MlxSdpaNax).is_ok()))
+            .unwrap_or(false)
+    })
+}
+
+/// `-[MTLDevice architecture]` (macOS 14+) name, parsed mlx-style into
+/// (generation, is_phone): e.g. "applegpu_g16s" -> (16, false),
+/// "applegpu_g17p" -> (17, true). None when the API or pattern is missing.
+fn device_architecture_gen(device: &metal::DeviceRef) -> Option<(u32, bool)> {
+    use metal::foreign_types::ForeignTypeRef;
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let dev: *mut Object = device.as_ptr() as *mut Object;
+        let responds: bool = msg_send![dev, respondsToSelector: sel!(architecture)];
+        if !responds {
+            return None;
+        }
+        let arch: *mut Object = msg_send![dev, architecture];
+        if arch.is_null() {
+            return None;
+        }
+        let name_obj: *mut Object = msg_send![arch, name];
+        if name_obj.is_null() {
+            return None;
+        }
+        let cstr: *const std::os::raw::c_char = msg_send![name_obj, UTF8String];
+        if cstr.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+        let digits: String = name
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let generation = digits.parse().ok()?;
+        Some((generation, name.ends_with('p')))
+    }
+}
+
+/// Whether the GPU is M5-class (arch generation >= 17, phones >= 18) with
+/// Metal-4 support — mirroring mlx::is_nax_available. This is a CORRECTNESS
+/// gate, not just performance: BaseNAXFrag::get_coord hardcodes the M5
+/// cooperative-tensor lane->element mapping, so the kernel computes wrong
+/// values under the pre-M5 emulation path.
+fn device_is_m5_class() -> bool {
+    let Some(device) = metal::Device::system_default() else { return false };
+    if !device.supports_family(metal::MTLGPUFamily::Metal4) {
+        return false;
+    }
+    let Some((generation, phone)) = device_architecture_gen(&device) else { return false };
+    generation >= if phone { 18 } else { 17 }
+}
+
+/// Runtime gate for the tensor-op kernel. `TRACT_METAL_SDPA_NAX`: "0"
+/// disables, "1" skips the M5-class device check (bring-up/debug ONLY —
+/// pre-M5 GPUs produce incorrect results, see device_is_m5_class), default
+/// requires an M5-class GPU. The library must also probe-compile.
+fn nax_runtime_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        match std::env::var("TRACT_METAL_SDPA_NAX").as_deref() {
+            Ok("0") => return false,
+            Ok("1") => {}
+            _ => {
+                if !device_is_m5_class() {
+                    return false;
+                }
+            }
+        }
+        nax_library_compiles()
+    })
 }
 
 /// Metal device op: fused SDPA via the ported MLX kernels.
@@ -610,5 +709,134 @@ mod tests {
     #[test]
     fn steel_decode_d80() -> TractResult<()> {
         run_case(f32::datum_type(), 1, 4, 4, 1, 100, 80, false)
+    }
+
+    // --- NAX (Metal-4 tensor-op) kernel. The kernel's fragment coordinate
+    // mapping is M5-hardware-specific (see device_is_m5_class), so numerical
+    // A/B runs only on an M5-class GPU; elsewhere (macOS 26+, pre-M5) the
+    // smoke test still proves compile + pipeline load + dispatch + ABI, and
+    // on macOS < 26 everything skips.
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_nax_case(
+        dt: DatumType,
+        b: usize,
+        hq: usize,
+        hkv: usize,
+        ql: usize,
+        kl: usize,
+        d: usize,
+        is_causal: bool,
+    ) -> TractResult<()> {
+        if !super::nax_library_compiles() {
+            eprintln!("skipping NAX case: library does not compile (needs macOS 26+)");
+            return Ok(());
+        }
+        if !super::device_is_m5_class() {
+            eprintln!("skipping NAX numerical case: not an M5-class GPU");
+            return Ok(());
+        }
+        let (q, k, v) = if dt == f16::datum_type() {
+            (
+                pseudo::<f16>(&[b, hq, ql, d], 1),
+                pseudo::<f16>(&[b, hkv, kl, d], 2),
+                pseudo::<f16>(&[b, hkv, kl, d], 3),
+            )
+        } else {
+            (
+                pseudo::<f32>(&[b, hq, ql, d], 1),
+                pseudo::<f32>(&[b, hkv, kl, d], 2),
+                pseudo::<f32>(&[b, hkv, kl, d], 3),
+            )
+        };
+        let reference = cpu_reference(dt, is_causal, &q, &k, &v)?;
+        let scale = (d as f32).recip().sqrt();
+        let metal = with_borrowed_metal_stream(|stream| {
+            let qd = q.clone().into_device()?;
+            let kd = k.clone().into_device()?;
+            let vd = v.clone().into_device()?;
+            let out = unsafe { DeviceTensor::uninitialized_dt(dt, &[b, hq, ql, d])? };
+            dispatch_steel_attention(
+                stream,
+                dt,
+                scale,
+                is_causal,
+                (b, hq, hkv, ql, kl, d),
+                &qd,
+                &kd,
+                &vd,
+                &out,
+                true,
+            )?;
+            stream.wait_until_completed()?;
+            Ok(out.to_host()?.into_tensor())
+        })?;
+        reference.close_enough(&metal, Approximation::Approximate).with_context(|| {
+            format!(
+                "NAX dt={dt:?} b={b} hq={hq} hkv={hkv} ql={ql} kl={kl} d={d} causal={is_causal}"
+            )
+        })
+    }
+
+    #[test]
+    fn nax_steel_f16_aligned() -> TractResult<()> {
+        run_nax_case(f16::datum_type(), 1, 4, 4, 64, 64, 64, false)
+    }
+
+    #[test]
+    fn nax_steel_f16_gqa_causal_unaligned() -> TractResult<()> {
+        run_nax_case(f16::datum_type(), 2, 8, 4, 33, 47, 64, true)
+    }
+
+    #[test]
+    fn nax_steel_f32_d128() -> TractResult<()> {
+        run_nax_case(f32::datum_type(), 1, 8, 2, 128, 128, 128, false)
+    }
+
+    #[test]
+    fn nax_steel_f32_unaligned_causal() -> TractResult<()> {
+        run_nax_case(f32::datum_type(), 1, 4, 4, 96, 160, 64, true)
+    }
+
+    // Pre-M5 smoke: the NAX library compiles, the pipeline specializes, the
+    // dispatch completes and writes finite values. Numerical correctness is
+    // M5-only (fragment mapping); this pins everything we can check without
+    // the hardware.
+    #[test]
+    fn nax_steel_smoke() -> TractResult<()> {
+        if !super::nax_library_compiles() {
+            eprintln!("skipping NAX smoke: library does not compile (needs macOS 26+)");
+            return Ok(());
+        }
+        let (b, hq, hkv, ql, kl, d) = (1usize, 4usize, 4usize, 64usize, 64usize, 64usize);
+        let q = pseudo::<f32>(&[b, hq, ql, d], 1);
+        let k = pseudo::<f32>(&[b, hkv, kl, d], 2);
+        let v = pseudo::<f32>(&[b, hkv, kl, d], 3);
+        let out = with_borrowed_metal_stream(|stream| {
+            let qd = q.clone().into_device()?;
+            let kd = k.clone().into_device()?;
+            let vd = v.clone().into_device()?;
+            let out =
+                unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[b, hq, ql, d])? };
+            dispatch_steel_attention(
+                stream,
+                f32::datum_type(),
+                (d as f32).recip().sqrt(),
+                false,
+                (b, hq, hkv, ql, kl, d),
+                &qd,
+                &kd,
+                &vd,
+                &out,
+                true,
+            )?;
+            stream.wait_until_completed()?;
+            Ok(out.to_host()?.into_tensor())
+        })?;
+        assert!(
+            out.view().as_slice::<f32>().unwrap().iter().all(|x| x.is_finite()),
+            "NAX dispatch produced non-finite values"
+        );
+        Ok(())
     }
 }
