@@ -24,6 +24,7 @@ pub mod fft;
 pub mod identity;
 pub mod konst;
 pub mod logic;
+pub mod lstm_cell;
 pub mod math;
 pub mod matmul;
 // pub mod memory;
@@ -295,7 +296,7 @@ pub trait TypedOp:
     /// expressions (a concrete integer is `TDim::Val(v)`; an expression
     /// can be any other TDim, including symbolic ones).
     #[allow(unused_variables)]
-    fn substitute_symbols(
+    fn set_symbols(
         &self,
         source: &TypedModel,
         node: &TypedNode,

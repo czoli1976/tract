@@ -25,7 +25,9 @@ mod deconv;
 mod delay_plus_downsample;
 mod delay_plus_pool;
 mod einsum;
+mod fft;
 mod pad_plus_conv;
+mod stft;
 
 #[allow(dead_code)]
 fn setup_test_logger() {
@@ -47,7 +49,7 @@ fn proptest_regular_against_pulse(
     let subs =
         std::collections::HashMap::from([(s.clone(), tract_data::prelude::TDim::Val(len as i64))]);
 
-    let concrete = model.clone().substitute_symbols(&subs).unwrap();
+    let concrete = model.clone().set_symbols(&subs).unwrap();
     if concrete.nodes.iter().any(|n| n.outputs.iter().any(|o| o.fact.shape.volume().is_zero())) {
         return Err(TestCaseError::reject("too short input"));
     }

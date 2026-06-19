@@ -17,7 +17,6 @@ use tract_core::ops::konst::Const;
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
-use tract_gpu::rewrite_rules::rewire_sdpa::rewire_sdpa;
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
 use tract_gpu::rewrite_rules::rms_norm::remove_rms_norm_cast;
 use tract_gpu::sync::{DeviceSyncKind, sync_inputs_if_required, sync_model_outputs_if_required};
@@ -28,6 +27,7 @@ use crate::rewrite_rules;
 
 /// A registered translator that can convert a core op into a Metal GPU op.
 /// Each kernel module submits one (or more) of these via [`register_metal_op!`].
+#[allow(clippy::type_complexity)]
 pub struct MetalOpTranslator {
     pub type_id: TypeId,
     pub try_make: fn(&TypedModel, &TypedNode) -> TractResult<Option<Box<dyn TypedOp>>>,
@@ -53,6 +53,30 @@ macro_rules! register_metal_op {
             }
         }
     };
+}
+
+/// Metal-local SDPA flattening: explode only the `Sdpa` nodes the MFA kernel
+/// can't fuse, leaving fusable ones for the `MetalMfaSdpa` translator. (The
+/// shared `tract_gpu` `rewire_sdpa` explodes all of them; cuda still uses it.)
+fn flatten_unfused_sdpa(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    _name: &str,
+    op: &tract_transformers::ops::sdpa::Sdpa,
+) -> TractResult<Option<TypedModelPatch>> {
+    let in_facts = model.node_input_facts(node.id)?;
+    if crate::kernels::matmul::mfa::mfa_sdpa_supported(op, &in_facts) {
+        Ok(None) // leave intact for the MetalMfaSdpa translator
+    } else {
+        op.patch_sdpa(model, node) // explode (same as the shared rewire_sdpa)
+    }
+}
+
+fn rewire_sdpa_metal(model: &mut TypedModel) -> TractResult<()> {
+    Rewriter::default()
+        .with_rule_for("flatten-unfused-sdpa", flatten_unfused_sdpa)
+        .rewrite(&(), model)
 }
 
 impl MetalGemmImplKind {
@@ -111,7 +135,7 @@ impl MetalTransform {
         // Init Metal Context if not done previously
         metal_context();
 
-        rewire_sdpa(model)?;
+        rewire_sdpa_metal(model)?;
         rewrite_einsum_to_prefix_matmul(model, false)?;
         if stop_at_phase == 0 {
             return Ok(());
@@ -210,26 +234,25 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Met
                 return sync_model_outputs_if_required(source, node, target, outlet_ids);
             }
         }
-        if let Some(conv) = node.op_as::<Conv>() {
-            if input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
-                && matches!(input_facts[0].datum_type, DatumType::F16 | DatumType::F32)
-            {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids =
-                    ops::conv::wire_metal_conv(source, node, target, &device_inputs, conv)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
-            }
+        if let Some(conv) = node.op_as::<Conv>()
+            && input_facts.iter().all(|f| DeviceTensor::is_supported_dt(f.datum_type))
+            && matches!(input_facts[0].datum_type, DatumType::F16 | DatumType::F32)
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids =
+                ops::conv::wire_metal_conv(source, node, target, &device_inputs, conv)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
         // Const: inline conversion, not a GPU op
-        if let Some(op) = node.op_as::<Const>() {
-            if DeviceTensor::is_supported_dt(op.val().datum_type()) {
-                let device_inputs =
-                    sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
-                let outlet_ids =
-                    target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
-                return sync_model_outputs_if_required(source, node, target, outlet_ids);
-            }
+        if let Some(op) = node.op_as::<Const>()
+            && DeviceTensor::is_supported_dt(op.val().datum_type())
+        {
+            let device_inputs =
+                sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToDevice)?;
+            let outlet_ids =
+                target.wire_node(node.name.clone(), convert_const(op)?, &device_inputs)?;
+            return sync_model_outputs_if_required(source, node, target, outlet_ids);
         }
 
         // Single-op translation.  See the matching CUDA path for rationale:
@@ -240,7 +263,7 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Met
         let target_inputs: TVec<TypedFact> = node
             .inputs
             .iter()
-            .map(|i| target.outlet_fact(mapping[i]).map(|f| f.clone()))
+            .map(|i| target.outlet_fact(mapping[i]).cloned())
             .collect::<TractResult<_>>()?;
         // Mirror sync_inputs_if_required(ToDevice): wrap non-device facts as
         // device facts so the GPU op's `output_facts` sees uniform device

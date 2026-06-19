@@ -110,7 +110,6 @@ pub mod internal {
     pub extern crate inventory;
     pub use crate::axes::{AxesMapping, Axis};
     pub use crate::late_bind::*;
-    pub use crate::model::*;
     pub use crate::ops::change_axes::*;
     pub use crate::ops::element_wise::ElementWiseMiniOp;
     pub use crate::ops::{Cost, EvalOp, FrozenOpState, Op, OpState, Validation};

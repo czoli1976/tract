@@ -134,17 +134,11 @@ pub struct Parameters {
     pub tract_model: Arc<dyn Model>,
     pub reference_model: Option<Arc<dyn Model>>,
 
-    #[cfg(feature = "conform")]
-    pub tf_model: Option<tract_tensorflow::conform::tf::Tensorflow>,
-
-    #[cfg(not(feature = "conform"))]
-    #[allow(dead_code)]
-    pub tf_model: (),
-
     pub tensors_values: TensorsValues,
     pub assertions: Assertions,
 
     pub machine_friendly: bool,
+    pub emit_jsonl: bool,
     pub allow_random_input: bool,
     pub allow_float_casts: bool,
 }
@@ -259,7 +253,7 @@ impl Parameters {
                             "Overriding model input shape named \"{}\". Replacing {} by {:?}.",
                             name.0,
                             String::from_utf8_lossy(&formatted),
-                            &shape
+                            shape
                         );
                         inv.arguments[0].rvalue = tract_nnef::ser::tdims(&shape);
                     }
@@ -373,8 +367,8 @@ impl Parameters {
                 let (name, tensor) =
                     tensor::for_data(symbol_table, file.path().to_str().unwrap(), fd)?;
                 result.push(TensorValues {
-                    input_index: Some(ix).filter(|_| is_input),
-                    output_index: Some(ix).filter(|_| is_output),
+                    input_index: is_input.then_some(ix),
+                    output_index: is_output.then_some(ix),
                     name,
                     values: tensor.value.concretize().map(|t| vec![t.into_tensor().into()]),
                     fact: Some(tensor.without_value()),
@@ -460,7 +454,7 @@ impl Parameters {
     /// `value` may be a plain integer or any TDim expression parseable
     /// against the model's symbol scope (e.g. `2*S` to rebase the
     /// streaming symbol onto a finer-grained chunk symbol before
-    /// pulsification).  Feeds straight into `model.substitute_symbols`.
+    /// pulsification).  Feeds straight into `model.set_symbols`.
     pub fn parse_set_subs(
         typed_model: &TypedModel,
         set: impl Iterator<Item = impl AsRef<str>>,
@@ -667,11 +661,11 @@ impl Parameters {
                         }
                         Err(e) => {
                             if e.is::<ModelBuildingError>() {
-                                return Err(e)?;
+                                Err(e)?;
                             } else if let Some(last_model) = last_model.take() {
-                                return Err(ModelBuildingError(last_model, e.into()))?;
+                                Err(ModelBuildingError(last_model, e.into()))?;
                             } else {
-                                return Err(e)?;
+                                Err(e)?;
                             }
                         }
                     }
@@ -778,15 +772,15 @@ impl Parameters {
         }
 
         if let Some(set) = matches.get_many::<String>("set") {
-            // --set delegates to model.substitute_symbols with a
-            // Symbol → TDim map (same path the `concretize_symbols`
+            // --set delegates to model.set_symbols with a
+            // Symbol → TDim map (same path the `set_symbols`
             // model transform takes).  Values may be plain integers or
             // TDim expressions (e.g. `--set T=2*S` to rebase the
             // streaming symbol).  Const TDim tensors are rewritten
-            // through Const's own substitute_symbols hook.
+            // through Const's own set_symbols hook.
             let subs = Self::parse_set_subs(typed_model.as_ref().unwrap(), set)?;
             stage!("set", typed_model -> typed_model, move |m: TypedModel| {
-                m.substitute_symbols(&subs)
+                m.set_symbols(&subs)
             });
             stage!("set-declutter", typed_model -> typed_model, |mut m| {
                 let mut dec = tract_core::optim::Optimizer::declutter();
@@ -859,36 +853,17 @@ impl Parameters {
         info!("Model {filename:?} loaded");
         info_usage("model loaded", probe);
 
-        let (need_tensorflow_model, need_reference_model) = match matches.subcommand() {
+        let need_reference_model = match matches.subcommand() {
             Some(("compare", sm)) => {
                 if let Some(with) = sm.get_one::<String>("stage").map(String::as_str) {
-                    (false, Some(with))
+                    Some(with)
                 } else if sm.get_flag("stream") {
-                    (false, Some("declutter"))
+                    Some("declutter")
                 } else {
-                    (true, None)
+                    None
                 }
             }
-            _ => (false, None),
-        };
-
-        #[cfg(not(feature = "conform"))]
-        let tf_model = ();
-        #[cfg(feature = "conform")]
-        let tf_model = if need_tensorflow_model {
-            info!("Tensorflow version: {}", tract_tensorflow::conform::tf::version());
-            if matches.get_flag("determinize") {
-                if let SomeGraphDef::Tf(ref graph) = graph {
-                    let graph = graph.write_to_bytes().unwrap();
-                    Some(tract_tensorflow::conform::tf::for_slice(&graph)?)
-                } else {
-                    unreachable!()
-                }
-            } else {
-                Some(tract_tensorflow::conform::tf::for_path(&filename)?)
-            }
-        } else {
-            None
+            _ => None,
         };
 
         let need_proto = matches.get_flag("proto")
@@ -1062,10 +1037,10 @@ impl Parameters {
             runnable,
             tract_model,
             reference_model,
-            tf_model,
             tensors_values,
             assertions,
             machine_friendly: matches.get_flag("machine-friendly"),
+            emit_jsonl: matches.get_flag("emit-jsonl"),
             allow_random_input,
             allow_float_casts,
         })
@@ -1237,7 +1212,7 @@ impl Assertions {
     }
 }
 
-fn http_client() -> TractResult<reqwest::blocking::Client> {
+pub(crate) fn http_client() -> TractResult<reqwest::blocking::Client> {
     use rustls::{ClientConfig, RootCertStore};
     use std::sync::Arc;
 

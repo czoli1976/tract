@@ -1,10 +1,14 @@
 name: Large models
 
 on:
-  pull_request:
   schedule:
     - cron:  '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number to test (from fork ok). Leave empty to run on selected branch."
+        required: false
+        type: number
 
 env:
   LARGE_MODELS: true
@@ -13,15 +17,57 @@ permissions:
   contents: read
 
 jobs:
-  cli: 
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      test_ref: ${{ steps.set.outputs.test_ref }}
+      pr_number: ${{ steps.set.outputs.pr_number }}
+    steps:
+      - id: set
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          STATUS_CONTEXT: "CI / large-models"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const prInput = context.payload.inputs?.pr_number;
+            core.setOutput('pr_number', prInput ? String(prInput) : '');
+            if (!prInput) {
+              core.setOutput('test_ref', process.env.GITHUB_SHA);
+              return;
+            }
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(prInput),
+            });
+            const sha = pr.data.head.sha;
+            core.setOutput('test_ref', sha);
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              state: 'pending',
+              context: process.env.STATUS_CONTEXT,
+              target_url: process.env.RUN_URL,
+              description: 'Running',
+            });
+
+  cli:
     name: Build tract on ${{ matrix.os }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ macos-latest, ubuntu-latest ]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ needs.prepare.outputs.test_ref }}
+          fetch-depth: 0
           persist-credentials: false
       - run: |
           ROOT=. ./.travis/ci-system-setup.sh
@@ -33,6 +79,7 @@ jobs:
           path: ./target/opt-no-lto/tract
 
   foundation-llms:
+    needs: prepare
     runs-on: ubuntu-latest
     outputs:
       models: ${{steps.set-matrix.outputs.models}}
@@ -55,7 +102,7 @@ jobs:
 
   foundation-llm:
     name: ${{ matrix.os }} / ${{matrix.rt}} / ${{ matrix.model }} / ${{ matrix.q }}
-    needs: [ cli, foundation-llms ]
+    needs: [ prepare, cli, foundation-llms ]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -84,12 +131,14 @@ jobs:
       contents: read
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - name: Configure AWS Credentials
       continue-on-error: true
-      uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6
+      uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
       with:
         role-to-assume: arn:aws:iam::567805100031:role/github-runner-tract-ci
         aws-region: us-east-2
@@ -119,7 +168,7 @@ jobs:
 
   parakeet-tdt-600m-v3:
     name: ${{matrix.os}} / Parakeet TDT 600m v3
-    needs: [ cli ]
+    needs: [ prepare, cli ]
     strategy:
       matrix:
         os: [ macOS, cuda-lovelace ]
@@ -129,8 +178,10 @@ jobs:
       contents: read
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - run: echo uname=$(uname) >> $GITHUB_ENV
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -148,7 +199,7 @@ jobs:
 
   nemotron-speech-streaming-en-06b:
     name: ${{matrix.os}} / Nemotron speech streaming en 0.6b
-    needs: [ cli ]
+    needs: [ prepare, cli ]
     strategy:
       matrix:
         os: [ macOS, cuda-lovelace ]
@@ -158,8 +209,10 @@ jobs:
       contents: read
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       with:
+        ref: ${{ needs.prepare.outputs.test_ref }}
+        fetch-depth: 0
         persist-credentials: false
     - run: echo uname=$(uname) >> $GITHUB_ENV
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -174,3 +227,55 @@ jobs:
         chmod +x "tract-cli-${UNAME}/tract"
         export TRACT_RUN="$GITHUB_WORKSPACE/tract-cli-${UNAME}/tract"
         ./harness/nemotron-speech-streaming-en-0.6b/ci.sh
+
+  report:
+    name: Report result to PR
+    needs: [ prepare, cli, foundation-llms, foundation-llm, parakeet-tdt-600m-v3, nemotron-speech-streaming-en-06b ]
+    if: ${{ always() && needs.prepare.outputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare.outputs.test_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: "CI / large-models"
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const sha = process.env.HEAD_SHA;
+            const runUrl = process.env.RUN_URL;
+            const statusContext = process.env.STATUS_CONTEXT;
+            const icon = r => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const jobs = Object.entries(needs).filter(([k]) => k !== 'prepare');
+            const failed = jobs.filter(([, v]) => v.result !== 'success' && v.result !== 'skipped');
+            const state = failed.length ? 'failure' : 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha, state,
+              context: statusContext, target_url: runUrl,
+              description: failed.length ? `${failed.length} job(s) failed` : 'All jobs passed',
+            });
+            const marker = `<!-- ${statusContext} -->`;
+            const body = [
+              marker,
+              `### ${icon(state)} ${statusContext}: ${state}`,
+              '',
+              ...jobs.map(([k, v]) => `- ${icon(v.result)} \`${k}\`: ${v.result}`),
+              '',
+              `[View workflow run](${runUrl})`,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100,
+            });
+            const prev = comments.find(c => c.body?.includes(marker));
+            if (prev) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: prev.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body });
+            }

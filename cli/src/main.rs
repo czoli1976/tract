@@ -24,6 +24,16 @@ use fs_err as fs;
 use readings_probe::*;
 
 mod bench;
+#[cfg(feature = "bench-suite")]
+mod bench_append;
+#[cfg(feature = "bench-suite")]
+mod bench_common;
+#[cfg(feature = "bench-suite")]
+mod bench_expectations;
+#[cfg(feature = "bench-suite")]
+mod bench_report;
+#[cfg(feature = "bench-suite")]
+mod bench_suite;
 mod compare;
 mod cost;
 mod dump;
@@ -171,6 +181,7 @@ fn main() -> TractResult<()> {
         .arg(arg!(--pulse [PULSE] "Translate to pulse network"))
 
         .arg(arg!(--"machine-friendly" "Machine friendly output"))
+        .arg(arg!(--"emit-jsonl" "Emit one JSON object per metric on stdout (bench-suite child contract)"))
         .arg(arg!(--"timeout" [SECONDS] "Kill the process after this many seconds"))
 
         .subcommand(Command::new("list-ops").about("List ops in TF/ONNX frameworks"))
@@ -185,9 +196,6 @@ fn main() -> TractResult<()> {
                 .long("stage")
                 .value_parser(clap::builder::PossibleValuesParser::new(STAGES))
                 .help("Loading pipeline stage to compare with"),
-        )
-        .arg(
-            Arg::new("tf").long("tf").action(ArgAction::SetTrue).help("Compare against tensorflow"),
         )
         .arg(
             Arg::new("twice")
@@ -210,7 +218,7 @@ fn main() -> TractResult<()> {
         )
         .group(
             ArgGroup::new("reference")
-                .args(&["npz", "pbdir", "stage", "tf", "twice", "stream"])
+                .args(["npz", "pbdir", "stage", "twice", "stream"])
                 .required(true),
         )
         .arg(
@@ -241,6 +249,56 @@ fn main() -> TractResult<()> {
         .long_about("Benchmarks tract on randomly generated input using criterion.");
     let criterion = run_options(criterion);
     app = app.subcommand(criterion);
+
+    #[cfg(feature = "bench-suite")]
+    {
+        app = app.subcommand(
+            clap::Command::new("bench-suite")
+                .long_about("Run a TOML manifest of benches, one fresh child process each.")
+                .arg(arg!(--manifest [PATH] "Bench manifest (default: benches.toml)"))
+                .arg(arg!(--"cache-dir" [PATH] "Model cache dir (default: $CACHEDIR or ~/.cache/tract-ci-minion-models)"))
+                .arg(arg!(--output [PATH] "Metrics output file (default: metrics)"))
+                .arg(arg!(--filter [SUBSTR] "Only run benches whose name contains SUBSTR"))
+                .arg(arg!(--"no-fetch" "Do not fetch models; use the cache as-is"))
+                .arg(arg!(--expectations [PATH] "Pre-computed expectations file; re-run benches that would show a PR red"))
+                .arg(arg!(--"retry-max" [N] "Max re-runs of an out-of-threshold bench (default: 2)"))
+                .arg(arg!(--"bench-data" [DIR] "Compute expectations inline from this bench-data checkout (alternative to --expectations)"))
+                .arg(arg!(--thresholds [PATH] "Threshold config TOML (with --bench-data)"))
+                .arg(arg!(--triple [TRIPLE] "Target triple (with --bench-data)"))
+                .arg(arg!(--device [DEVICE] "Device key (with --bench-data)"))
+                .arg(arg!(--window [N] "Trailing nights to median over (with --bench-data; default: 10)")),
+        );
+        app = app.subcommand(
+            clap::Command::new("bench-expectations")
+                .long_about("Emit per-metric expectations for one (triple, device) from bench-data history.")
+                .arg(arg!(--"bench-data" <DIR> "bench-data checkout root"))
+                .arg(arg!(--thresholds <PATH> "Threshold config TOML"))
+                .arg(arg!(--triple <TRIPLE> "Target triple"))
+                .arg(arg!(--device <DEVICE> "Device key"))
+                .arg(arg!(--out <PATH> "Output expectations file"))
+                .arg(arg!(--window [N] "Trailing nights to median over (default: 10)")),
+        );
+        app = app.subcommand(
+            clap::Command::new("bench-append")
+                .long_about("Append one nightly run to the columnar bench-data branch.")
+                .arg(arg!(--metrics <PATH> "Metrics file produced by bench-suite"))
+                .arg(arg!(--out <DIR> "bench-data checkout root"))
+                .arg(arg!(--triple <TRIPLE> "Target triple"))
+                .arg(arg!(--device <DEVICE> "Device key"))
+                .arg(arg!(--day [DATE] "Run day YYYY-MM-DD (default: today)")),
+        );
+        app = app.subcommand(
+            clap::Command::new("bench-report")
+                .long_about("Render the PR-vs-main bench comparison comment + job summary.")
+                .arg(arg!(--results <DIR> "Dir of per-device result subdirs (meta.json + metrics)"))
+                .arg(arg!(--"bench-data" <DIR> "bench-data checkout root (the nightly reference)"))
+                .arg(arg!(--thresholds <PATH> "Threshold config TOML"))
+                .arg(arg!(--"pr-sha" <SHA> "PR commit sha"))
+                .arg(arg!(--out <PATH> "PR comment markdown output path"))
+                .arg(arg!(--templates [DIR] "Template dir (default: .travis)"))
+                .arg(arg!(--today [DATE] "Override today's date YYYY-MM-DD (for reproducible output)")),
+        );
+    }
 
     app = app.subcommand(dump_subcommand());
 
@@ -522,7 +580,7 @@ fn assertions_options(command: clap::Command) -> clap::Command {
             Arg::new("assert-op-count")
             .value_parser(clap::builder::NonEmptyStringValueParser::new())
             .number_of_values(2)
-            .value_names(&["operator", "count"])
+            .value_names(["operator", "count"])
             .action(clap::ArgAction::Append)
             .long("assert-op-count")
             .help("Specified operator must appear exactly the specified number of times. This argument can appear multiple times."),
@@ -559,7 +617,8 @@ fn run_options(command: clap::Command) -> clap::Command {
                 .long("set")
                 .action(clap::ArgAction::Append)
                 .number_of_values(1)
-                .help("Set a symbol value before running the model (--set S=12)"),
+                .help("Bind a symbol before running the model.  RHS is a TDim expression \
+                       reduced to i64 against symbols set so far (--set S=12, --set T=2*S)."),
         )
         .arg(
             Arg::new("input-from-nnef").long("input-from-nnef").num_args(1).help(
@@ -746,6 +805,14 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
             return Ok(());
         }
         Some(("hwbench", _)) => return hwbench::handle(),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-suite", m)) => return bench_suite::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-append", m)) => return bench_append::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-expectations", m)) => return bench_expectations::handle(m),
+        #[cfg(feature = "bench-suite")]
+        Some(("bench-report", m)) => return bench_report::handle(m),
         Some(("kernels", _)) => {
             println!();
             fn colored_name(m: &dyn MatMatMul) -> String {

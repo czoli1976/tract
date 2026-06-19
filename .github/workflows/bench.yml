@@ -1,0 +1,230 @@
+name: Bench
+
+# Build tract on GitHub-hosted runners, run the bench suite on the self-hosted bench
+# machines, and either (nightly) append one row per run to the bench-data branch, or
+# (PR) compare against that reference and post a single fan-in comment.
+# The Jetson (aarch64 + CUDA 12) can't be built on a hosted runner natively, so it
+# reuses cross.sh's debian-stretch cross-build (no AWS creds, so the S3-push tail stays off).
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # after large-models (3am) so they don't fight for the self-hosted boxes
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'doc/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # cancel superseded PR pushes (escape hatch); nightly keys on run_id so it never cancels
+  group: bench-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      ref: ${{ steps.gate.outputs.ref }}
+      day: ${{ steps.gate.outputs.day }}
+    steps:
+      - id: gate
+        env:
+          BENCH_ENABLED: ${{ vars.BENCH_ENABLED }}
+        run: |
+          if [ "$BENCH_ENABLED" = "false" ]; then
+            echo "::notice::bench disabled via BENCH_ENABLED repo variable"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.enabled == 'true'
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: aarch64-apple-darwin
+            host: macos-latest
+            build: ROOT=. ./.travis/ci-system-setup.sh && cargo build -p tract-cli --release --features bench-suite
+            bin: target/release/tract
+          - triple: x86_64-unknown-linux-gnu
+            host: ubuntu-latest
+            build: ROOT=. ./.travis/ci-system-setup.sh && cargo build -p tract-cli --release --features bench-suite
+            bin: target/release/tract
+          - triple: aarch64-unknown-linux-gnu-stretch
+            host: ubuntu-latest
+            build: PLATFORM=aarch64-unknown-linux-gnu-stretch ./.travis/cross.sh
+            bin: target/aarch64-unknown-linux-gnu/release/tract
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - run: ${{ matrix.build }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tract-cli-${{ matrix.triple }}
+          path: ${{ matrix.bin }}
+
+  bench:
+    needs: [ prepare, build ]
+    if: needs.prepare.outputs.enabled == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write     # push to bench-data (nightly only)
+    concurrency:
+      group: bench-runner-${{ matrix.runner }}   # one bench per box at a time; never fight a running bench
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: apple-m1-max
+            runner: macOS
+            triple: aarch64-apple-darwin
+          - target: i9-11900kb_rtx-4060
+            runner: cuda-lovelace
+            triple: x86_64-unknown-linux-gnu
+          - target: jetson-orin-nx
+            runner: orin-nx-16g
+            triple: aarch64-unknown-linux-gnu-stretch
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: tract-cli-${{ matrix.triple }}
+          path: tract-cli
+      # Read-only bench-data checkout: the orchestrator builds this device's retry
+      # expectations from it inline (no separate job, no Python on the runner).
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: bench-data
+          path: bench-ref
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run bench suite
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          DEVICE: ${{ matrix.target }}
+        run: |
+          chmod +x tract-cli/tract
+          # no --cache-dir: honor each runner's CACHEDIR env (its curated model cache),
+          # falling back to ~/.cache/tract-ci-minion-models, like the old bundle did.
+          tract-cli/tract bench-suite \
+            --manifest .travis/benches.toml \
+            --bench-data bench-ref \
+            --thresholds .travis/bench-thresholds.toml \
+            --triple "$TRIPLE" --device "$DEVICE"        # produces ./metrics
+
+      # --- nightly / dispatch: append the row to bench-data ---
+      - name: Checkout bench-data
+        if: github.event_name != 'pull_request'
+        # zizmor: ignore[artipacked] credentials are needed to push the row back to
+        # bench-data; this checkout is never uploaded as an artifact.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: bench-data
+          path: bench-data
+          fetch-depth: 1
+      - name: Append and push
+        if: github.event_name != 'pull_request'
+        env:
+          DEVICE: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+          REF: ${{ needs.prepare.outputs.ref }}
+          DAY: ${{ needs.prepare.outputs.day }}
+        run: |
+          tract-cli/tract bench-append --metrics metrics --out bench-data \
+            --triple "$TRIPLE" --device "$DEVICE" --day "$DAY"
+          cd bench-data
+          git config user.name "tract-ci"
+          git config user.email "tract-ci@users.noreply.github.com"
+          git add -A
+          git commit -m "bench: $DEVICE $DAY ${REF:0:9}"
+          for i in 1 2 3 4 5; do
+            git push origin HEAD:bench-data && exit 0
+            git fetch origin bench-data
+            git rebase origin/bench-data || git rebase --abort
+          done
+          echo "push failed after retries" >&2; exit 1
+
+      # --- PR: emit this device's result for the fan-in report job ---
+      - name: Stage PR result
+        if: github.event_name == 'pull_request'
+        env:
+          DEVICE: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          mkdir -p result
+          cp metrics result/metrics
+          printf '{"device":"%s","triple":"%s"}\n' "$DEVICE" "$TRIPLE" > result/meta.json
+      - name: Upload PR result
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-result-${{ matrix.target }}
+          path: result
+
+  report:
+    needs: [ prepare, build, bench ]
+    # !cancelled() (not always()) so a superseded/cancelled bench doesn't produce a vacuous
+    # "no regressions" comment; bench-report writes no file when there's nothing to compare.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.prepare.outputs.enabled == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: bench-result-*
+          path: results
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: tract-cli-x86_64-unknown-linux-gnu
+          path: tract-cli
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: bench-data
+          path: bench-data
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Render comparison
+        env:
+          PR_SHA: ${{ needs.prepare.outputs.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          chmod +x tract-cli/tract
+          tract-cli/tract bench-report --results results --bench-data bench-data \
+            --thresholds .travis/bench-thresholds.toml --pr-sha "$PR_SHA" --out pr-comment.md
+      # Hand the rendered comment + target PR to the bench-comment workflow to post. Posting
+      # is split out via workflow_run because this pull_request run gets a read-only token on
+      # fork PRs and can't comment. No file => nothing comparable => no artifact => nothing posted.
+      - name: Stage comment for the trampoline
+        if: ${{ hashFiles('pr-comment.md') != '' }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p bench-comment
+          mv pr-comment.md bench-comment/
+          printf '%s\n' "$PR_NUMBER" > bench-comment/pr-number
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: ${{ hashFiles('bench-comment/pr-comment.md') != '' }}
+        with:
+          name: bench-comment
+          path: bench-comment
