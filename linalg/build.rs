@@ -117,6 +117,21 @@ fn assembler_supports_amx_bf16() -> bool {
         .is_ok()
 }
 
+// ACE (AI Compute Extensions). No assembler accepts the ACE mnemonics today, so
+// this probe is expected to FAIL on every current toolchain, leaving cfg(tract_ace)
+// unset and the portable emulated ACE kernels (src/ace/) in place. It exists so
+// that when binutils/LLVM gain ACE support the real ACE .S kernels can be wired in
+// without touching the Rust-side seam (the cfg(tract_ace) swap points in src/ace).
+fn assembler_supports_ace() -> bool {
+    cc::Build::new()
+        .file("x86_64/ace/dummy_ace.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_ace_probe")
+        .is_ok()
+}
+
 fn include_sve() -> bool {
     // SVE/SVE2 lives on ARMv9 server/mobile cores (Neoverse V1+/N2+, Cortex-X2+,
     // Graviton 3/4) — Linux aarch64. No Apple silicon has SVE.
@@ -222,6 +237,7 @@ fn main() {
     // Set below only when the assembler accepts the `{vex}` prefix on
     // VPDPBUSD (binutils >= 2.36) -- needed for the AVX-VNNI ymm kernel.
     println!("cargo:rustc-check-cfg=cfg(tract_avxvnni)");
+    println!("cargo:rustc-check-cfg=cfg(tract_ace)");
 
     match arch.as_ref() {
         "x86_64" => {
@@ -379,6 +395,15 @@ fn main() {
             if os != "windows" && !avxvnni_files.is_empty() && assembler_supports_avxvnni() {
                 cc::Build::new().files(&avxvnni_files).compile("x86_64_avxvnni");
                 println!("cargo:rustc-cfg=tract_avxvnni");
+            }
+
+            // ACE (AI Compute Extensions): future-looking seam. The probe fails on
+            // every current toolchain, so `tract_ace` stays unset and the emulated
+            // ACE kernels (src/ace/, pure Rust) remain active. When binutils/LLVM
+            // gain ACE, this sets the cfg and the real ACE .S kernels (to be added)
+            // would compile here; the src/ace swap points then resolve to them.
+            if os != "windows" && assembler_supports_ace() {
+                println!("cargo:rustc-cfg=tract_ace");
             }
         }
         "arm" | "armv7" => {
