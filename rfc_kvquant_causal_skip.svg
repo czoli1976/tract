@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="760" height="460" fill="#ffffff"/>
+<text x="78" y="34" font-size="21" font-weight="700" fill="#1a1a1a">Causal-skip — per-query latency ∝ visible tokens (prefill, bit-exact)</text>
+<text x="78" y="56" font-size="13.5" fill="#666">decode tok/s unaffected; halves prompt attention (P²→P²/2); ~26% of prefill at 32K</text>
+<line x1="78" y1="390.0" x2="734" y2="390.0" stroke="#eee"/>
+<text x="68" y="394.0" font-size="11.5" fill="#999" text-anchor="end">0.0</text>
+<line x1="78" y1="327.6" x2="734" y2="327.6" stroke="#eee"/>
+<text x="68" y="331.6" font-size="11.5" fill="#999" text-anchor="end">2.4</text>
+<line x1="78" y1="265.2" x2="734" y2="265.2" stroke="#eee"/>
+<text x="68" y="269.2" font-size="11.5" fill="#999" text-anchor="end">4.8</text>
+<line x1="78" y1="202.8" x2="734" y2="202.8" stroke="#eee"/>
+<text x="68" y="206.8" font-size="11.5" fill="#999" text-anchor="end">7.2</text>
+<line x1="78" y1="140.4" x2="734" y2="140.4" stroke="#eee"/>
+<text x="68" y="144.4" font-size="11.5" fill="#999" text-anchor="end">9.6</text>
+<line x1="78" y1="78.0" x2="734" y2="78.0" stroke="#eee"/>
+<text x="68" y="82.0" font-size="11.5" fill="#999" text-anchor="end">12.0</text>
+<text x="20" y="234" font-size="12.5" fill="#666" transform="rotate(-90 20 234)" text-anchor="middle">microseconds</text>
+<rect x="117.4" y="98.8" width="136.9" height="291.2" rx="2.5" fill="#2BB673"/>
+<text x="185.8" y="93.8" font-size="11" fill="#444" text-anchor="middle">11.2</text>
+<text x="187.3" y="412" font-size="13" fill="#333" text-anchor="middle">valid 100% (2048)</text>
+<rect x="336.0" y="270.4" width="136.9" height="119.6" rx="2.5" fill="#2BB673"/>
+<text x="404.5" y="265.4" font-size="11" fill="#444" text-anchor="middle">4.6</text>
+<text x="406.0" y="412" font-size="13" fill="#333" text-anchor="middle">valid 50% (1024)</text>
+<rect x="554.7" y="327.6" width="136.9" height="62.4" rx="2.5" fill="#2BB673"/>
+<text x="623.2" y="322.6" font-size="11" fill="#444" text-anchor="middle">2.4</text>
+<text x="624.7" y="412" font-size="13" fill="#333" text-anchor="middle">valid 25% (512)</text>
+<rect x="78" y="428" width="13" height="13" rx="2.5" fill="#2BB673"/>
+<text x="97" y="439" font-size="12.5" fill="#333">int4 SIMD</text>
+</svg>

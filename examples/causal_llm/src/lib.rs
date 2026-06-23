@@ -307,6 +307,32 @@ impl CausalLlmState {
             .to_vec())
     }
 
+    /// Total bytes currently held by the KV cache tensors, at their real dtype (measured).
+    pub fn kv_cache_bytes(&self) -> anyhow::Result<usize> {
+        let mut total = 0;
+        for t in &self.kv_caches {
+            let (dt, shape, _) = t.as_bytes()?;
+            total += shape.iter().product::<usize>() * dt.size_of();
+        }
+        Ok(total)
+    }
+
+    /// Datum type of the KV cache tensors (e.g. F16).
+    pub fn kv_cache_dt(&self) -> anyhow::Result<Option<DatumType>> {
+        Ok(match self.kv_caches.first() {
+            Some(t) => Some(t.as_bytes()?.0),
+            None => None,
+        })
+    }
+
+    /// Current cache sequence length (tokens stored along the cache axis).
+    pub fn kv_seq_len(&self) -> anyhow::Result<usize> {
+        Ok(match (self.kv_caches.first(), self.model.kv_caches.first()) {
+            (Some(t), Some(info)) => t.as_bytes()?.1.get(info.axis).copied().unwrap_or(0),
+            _ => 0,
+        })
+    }
+
     pub fn freeze(self) -> FrozenCausalLlmState {
         FrozenCausalLlmState {
             model: self.model,

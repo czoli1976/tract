@@ -1,5 +1,6 @@
 pub mod apply_rope;
 pub mod gelu_approximate;
+pub mod kv_int4;
 pub mod leaky_relu;
 pub mod reduce;
 pub mod rms_norm;

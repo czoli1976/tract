@@ -8,6 +8,9 @@ anyhow.workspace = true
 float-ord = "0.3.2"
 ndarray.workspace = true
 tract.workspace = true
+tract-core = { path = "../../core" }
+tract-nnef = { path = "../../nnef" }
+tract-transformers = { path = "../../transformers" }
 axum = "0.8.4"
 tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }

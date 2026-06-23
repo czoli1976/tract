@@ -28,6 +28,7 @@ const BASIC_MAT_MUL: &str = include_str!("matmul/basic/basic_mat_mul.metal");
 const ARRAY_OPS: &str = include_str!("array/array_ops.metal");
 const BIN_OPS: &str = include_str!("bin_ops.metal");
 const NN_OPS: &str = include_str!("nn/nn_ops.metal");
+const KV_INT4: &str = include_str!("nn/kv_int4.metal");
 const CONV_OPS: &str = include_str!("conv.metal");
 const ELEMENT_WISE_OPS: &str = include_str!("element_wise.metal");
 
@@ -47,6 +48,7 @@ pub enum LibraryName {
     ArrayOps,
     ConvOps,
     NNOps,
+    KvInt4,
     ElementWiseOps,
     Ggml,
 }
@@ -60,6 +62,7 @@ impl LibraryName {
             Self::BinOps => LibraryContent::Source(BIN_OPS),
             Self::ConvOps => LibraryContent::Source(CONV_OPS),
             Self::NNOps => LibraryContent::Source(NN_OPS),
+            Self::KvInt4 => LibraryContent::Source(KV_INT4),
             Self::ElementWiseOps => LibraryContent::Source(ELEMENT_WISE_OPS),
             Self::MlxGemm => LibraryContent::Source(MLX_GEMM),
             Self::MlxGemv => LibraryContent::Source(MLX_GEMV),

@@ -15,6 +15,7 @@ register_simple_model_transform!(
 );
 register_simple_model_transform!("unfold_kv_cache", UnfoldKeyValueCacheTransform);
 register_simple_model_transform!("transformers_detect_all", TransformersTransform);
+register_simple_model_transform!("fuse_quantized_kv_sdpa", ops::kv_quant::QuantizedKvSdpaTransform);
 
 pub fn register(registry: &mut Registry) {
     ops::apply_rope::register(registry);

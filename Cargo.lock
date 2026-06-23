@@ -545,6 +545,9 @@ dependencies = [
  "tokio",
  "tokio-scoped",
  "tract",
+ "tract-core",
+ "tract-nnef",
+ "tract-transformers",
 ]
 
 [[package]]

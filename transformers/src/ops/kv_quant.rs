@@ -20,7 +20,6 @@ use tract_nnef::tract_core::transform::ModelTransform;
 use tract_nnef::tract_ndarray::{Array2, Array4, ArrayView2, Ix4, s};
 
 use crate::ops::dyn_kv_cache::DynKeyValueCache;
-use crate::ops::flash_sdpa::FlashSdpaOp;
 use crate::ops::sdpa::Sdpa;
 
 // ── NNEF ser/de ───────────────────────────────────────────────────────────────────────────────
@@ -35,6 +34,8 @@ pub fn register(registry: &mut Registry) {
             TypeName::Scalar.tensor().named("v"),
             TypeName::Integer.named("axis"),
             TypeName::Scalar.named("scale"),
+            TypeName::Integer.named("causal"),
+            TypeName::Integer.named("n_recent"),
         ],
         &[("output", TypeName::Scalar.tensor())],
         de_quantized_kv_sdpa,
@@ -49,7 +50,11 @@ fn ser_quantized_kv_sdpa(
     let q = ast.mapping[&node.inputs[0]].clone();
     let k = ast.mapping[&node.inputs[1]].clone();
     let v = ast.mapping[&node.inputs[2]].clone();
-    let mut attrs = vec![("axis", numeric(op.axis))];
+    let mut attrs = vec![
+        ("axis", numeric(op.axis)),
+        ("causal", numeric(op.causal as i64)),
+        ("n_recent", numeric(op.n_recent)),
+    ];
     if let Some(scale) = op.scale {
         attrs.push(("scale", numeric(scale)));
     }
@@ -65,7 +70,11 @@ fn de_quantized_kv_sdpa(
     let v = invocation.named_arg_as(builder, "v")?;
     let axis: usize = invocation.named_arg_as(builder, "axis")?;
     let scale: Option<f32> = invocation.get_named_arg_as(builder, "scale")?;
-    builder.wire(QuantizedKvSdpa { axis, scale }, &[q, k, v])
+    let causal: bool =
+        invocation.get_named_arg_as::<i64>(builder, "causal")?.map(|v| v != 0).unwrap_or(false);
+    let n_recent: usize =
+        invocation.get_named_arg_as::<i64>(builder, "n_recent")?.map(|v| v as usize).unwrap_or(0);
+    builder.wire(QuantizedKvSdpa { axis, scale, causal, n_recent }, &[q, k, v])
 }
 
 /// Affine quantize→dequantize a `[rows, cols]` matrix at `bits` bits, returning the
@@ -94,6 +103,66 @@ pub fn quant_dequant(x: ArrayView2<f32>, bits: u32, by_row: bool) -> Array2<f32>
         }
     }
     out
+}
+
+// ── Fixed Hadamard rotation (data-free outlier spreading) ───────────────────────────────────────
+// The shared trick of TurboQuant (random rotation) and OSCAR (calibrated rotation): rotate the
+// head-dim vector into a basis where outlier-channel energy is spread across all coordinates, so a
+// shared per-group scale no longer has to straddle a huge dynamic range. The *calibration-free*
+// instance is a fixed (Sylvester) Hadamard — what QuaRot/SpinQuant established and what
+// TurboQuant's random rotation reduces to in practice. Two clean properties for KV:
+//   • Keys: rotate Q and K by the same orthonormal H ⇒ (QH)(KH)ᵀ = QKᵀ, scores bit-identical,
+//     so the rotation only ever *helps* K quantization — no accuracy argument needed, it's an
+//     identity. (H is symmetric, Hᵀ=H, H·H=I.)
+//   • Values: store V·H quantized; after P·(V·H) recover the true output by right-multiplying H
+//     (linear, exact up to the quant error which is now spread across channels).
+
+/// Normalized (orthonormal) Hadamard matrix of size `n` (must be a power of two). Symmetric
+/// (`Hᵀ = H`) and an involution (`H·H = I`), so the same matrix rotates and un-rotates.
+pub fn hadamard_normalized(n: usize) -> Array2<f32> {
+    assert!(n.is_power_of_two() && n > 0, "Hadamard size must be a power of two, got {n}");
+    let mut h = Array2::<f32>::zeros((n, n));
+    h[(0, 0)] = 1.0;
+    let mut size = 1;
+    while size < n {
+        for i in 0..size {
+            for j in 0..size {
+                let v = h[(i, j)];
+                h[(i, j + size)] = v;
+                h[(i + size, j)] = v;
+                h[(i + size, j + size)] = -v;
+            }
+        }
+        size *= 2;
+    }
+    let norm = 1.0 / (n as f32).sqrt();
+    h.mapv_inplace(|x| x * norm);
+    h
+}
+
+/// In-place fast Walsh–Hadamard transform (normalized), O(n log n). Natural (Sylvester) ordering,
+/// so `fwht_normalized(x)` equals `x · hadamard_normalized(n)` but without the O(n²) matmul — this
+/// is what makes the rotation cheap enough to run per query in the decode loop.
+pub fn fwht_normalized(x: &mut [f32]) {
+    let n = x.len();
+    assert!(n.is_power_of_two() && n > 0, "FWHT length must be a power of two, got {n}");
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let (a, b) = (x[j], x[j + h]);
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+            i += 2 * h;
+        }
+        h *= 2;
+    }
+    let norm = (n as f32).sqrt().recip();
+    for v in x.iter_mut() {
+        *v *= norm;
+    }
 }
 
 // ── Packed u8 storage ─────────────────────────────────────────────────────────────────────────
@@ -156,6 +225,16 @@ impl QuantValueCache {
             }
         }
         out
+    }
+    /// Streaming P·V: `out += p · dequant(V[t])` (per-token scale), no row materialized.
+    /// This is the seam where Milestone 2 replaces the f32 multiply with an int dot.
+    #[inline]
+    pub fn accumulate_into(&self, t: usize, p: f32, out: &mut [f32]) {
+        let (lo, scale) = self.params[t];
+        let row = &self.packed[t * self.d..(t + 1) * self.d];
+        for (o, &b) in out.iter_mut().zip(row) {
+            *o += p * (lo + b as f32 * scale);
+        }
     }
     pub fn memory_bytes(&self) -> usize {
         self.packed.len() + self.params.len() * 8
@@ -232,8 +311,234 @@ impl QuantKeyCache {
         }
         out
     }
+    /// Streaming score: `q · dequant(K[t])` (per-channel scale), no row materialized.
+    /// Milestone 2 will fold the per-channel scale into Q so this becomes an int·int dot —
+    /// which is exactly why the per-token-K + Hadamard layout is needed (shared scale).
+    #[inline]
+    pub fn score_with(&self, t: usize, q: &[f32]) -> f32 {
+        let row = &self.packed[t * self.d..(t + 1) * self.d];
+        let mut acc = 0.0f32;
+        for c in 0..self.d {
+            acc += q[c] * (self.ch_lo[c] + row[c] as f32 * self.ch_scale[c]);
+        }
+        acc
+    }
     pub fn memory_bytes(&self) -> usize {
         self.packed.len() + self.d * 8 // D*(lo+scale) = D*8 bytes
+    }
+}
+
+// ── Milestone 2: integer-domain attention (per-token K + Hadamard + int8×int4 i32 dot) ──────────
+// This is the layout that actually *banks the speed*: K and V are stored as packed signed int4 in
+// the Hadamard-rotated basis with a single per-token scale, so the score is a pure integer dot —
+// int8(Q) · int4(K) → i32 — with the scales pulled outside the reduction. Per-channel K (Milestone
+// 1) structurally can't do this: its scale lives inside the sum. The Hadamard is what makes the
+// per-token (shared-scale) layout survive outlier channels. K read drops to ¼ of f16 (the dominant
+// decode-bandwidth term), and the dot is cheap integer MACs.
+
+/// Symmetric (zero-point-free) quantization to signed ints in `-qmax..=qmax`. Returns codes and the
+/// scale s such that x ≈ code·s. Zero-point-free so the dot needs no offset-correction term.
+fn quant_sym(x: &[f32], qmax: i32) -> (Vec<i8>, f32) {
+    let amax = x.iter().fold(0f32, |a, &v| a.max(v.abs()));
+    let scale = if amax > 0.0 { amax / qmax as f32 } else { 1.0 };
+    let inv = scale.recip();
+    let q = qmax as f32;
+    let codes = x.iter().map(|&v| (v * inv).round().clamp(-q, q) as i8).collect();
+    (codes, scale)
+}
+
+/// Fused symmetric-int4 quantize + pack of an already-rotated token, appended directly into
+/// `packed` (even index → low nibble, odd → high nibble). Returns the per-token scale. No
+/// intermediate code/byte Vec — keeps the push hot path allocation-free. Bit-identical to
+/// `quant_sym(rotated, 7)` followed by the old two-per-byte pack.
+fn quant_pack_i4(rotated: &[f32], packed: &mut Vec<u8>) -> f32 {
+    let amax = rotated.iter().fold(0f32, |a, &v| a.max(v.abs()));
+    let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+    let inv = scale.recip();
+    let start = packed.len();
+    packed.resize(start + rotated.len().div_ceil(2), 0);
+    for (i, &v) in rotated.iter().enumerate() {
+        let nib = (((v * inv).round().clamp(-7.0, 7.0) as i8) as u8) & 0x0F;
+        if i % 2 == 0 {
+            packed[start + i / 2] |= nib;
+        } else {
+            packed[start + i / 2] |= nib << 4;
+        }
+    }
+    scale
+}
+
+/// Per-token int4 KV cache in the Hadamard basis. K and V each: ⌈D/2⌉ bytes + one f32 scale per
+/// token. Decode reads int4 and scores with an integer dot — the Milestone-2 speed path.
+///
+/// Milestone 5 (mixed precision): the most recent `n_recent` tokens are held in **full f32**
+/// (exact) and only age into the int4 store once they leave the window. Recent tokens dominate
+/// attention and are the cheapest to keep exact, so this is the lever that lets the int4 (or, later,
+/// int2) body stay accurate — the OSCAR/StreamingLLM "keep sink/recent high-precision" trick.
+#[derive(Clone, Debug)]
+pub struct QuantKvInt4 {
+    pub d: usize,
+    k_packed: Vec<u8>,
+    k_scale: Vec<f32>,
+    v_packed: Vec<u8>,
+    v_scale: Vec<f32>,
+    n_recent: usize,
+    recent: Vec<(Vec<f32>, Vec<f32>)>, // exact-f32 window of the newest tokens (k, v)
+    len: usize,                        // total tokens = quantized + recent
+    scratch: Vec<f32>,                 // reused rotation buffer — keeps push() allocation-free
+}
+
+impl QuantKvInt4 {
+    pub fn new(d: usize) -> Self {
+        Self::with_recent(d, 0)
+    }
+    /// `n_recent` newest tokens are kept exact (f32); older tokens are int4. `n_recent = 0` is the
+    /// pure-int4 cache; `n_recent ≥ len` is exact f32.
+    pub fn with_recent(d: usize, n_recent: usize) -> Self {
+        assert!(d.is_power_of_two(), "head dim must be a power of two for FWHT, got {d}");
+        QuantKvInt4 {
+            d,
+            k_packed: Vec::new(),
+            k_scale: Vec::new(),
+            v_packed: Vec::new(),
+            v_scale: Vec::new(),
+            n_recent,
+            recent: Vec::new(),
+            len: 0,
+            scratch: Vec::new(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// x·H via FWHT (H symmetric, so this both rotates and un-rotates), O(D log D).
+    fn rotate(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = x.to_vec();
+        fwht_normalized(&mut out);
+        out
+    }
+    /// Rotate + per-token int4 quantize one token into the packed store, allocation-free: the
+    /// rotation reuses `self.scratch` and the quantize-and-pack writes straight into the byte store.
+    fn push_quantized(&mut self, k: &[f32], v: &[f32]) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend_from_slice(k);
+        fwht_normalized(&mut scratch);
+        let ks = quant_pack_i4(&scratch, &mut self.k_packed);
+        scratch.clear();
+        scratch.extend_from_slice(v);
+        fwht_normalized(&mut scratch);
+        let vs = quant_pack_i4(&scratch, &mut self.v_packed);
+        self.scratch = scratch;
+        self.k_scale.push(ks);
+        self.v_scale.push(vs);
+    }
+    /// Append one token. It enters the exact f32 recent window; the token that falls out of the
+    /// window (if any) is quantized into the int4 store.
+    pub fn push_token(&mut self, k: &[f32], v: &[f32]) {
+        self.recent.push((k.to_vec(), v.to_vec()));
+        if self.recent.len() > self.n_recent {
+            let (ko, vo) = self.recent.remove(0);
+            self.push_quantized(&ko, &vo);
+        }
+        self.len += 1;
+    }
+    /// Single-query decode attention over the whole cache. Quantized tokens score via
+    /// int8(Q)·int4(K)→i32 in the Hadamard basis; recent f32 tokens score exactly.
+    pub fn attend(&self, q: &[f32], scale: f32) -> Vec<f32> {
+        self.attend_limited(q, scale, self.len.saturating_sub(1))
+    }
+    /// Causal attention: attend only to absolute token indices `0..=limit`. One joint softmax over
+    /// the visible quantized + recent tokens (masked tokens get exp()=0).
+    pub fn attend_limited(&self, q: &[f32], scale: f32, limit: usize) -> Vec<f32> {
+        let d = self.d;
+        let bpt = d.div_ceil(2); // bytes per token
+        let n_q = self.k_scale.len(); // quantized token count
+        let (qc, sq) = quant_sym(&self.rotate(q), 127);
+        let mut scores = vec![f32::NEG_INFINITY; self.len];
+        let mut row_max = f32::NEG_INFINITY;
+        // quantized tokens [0..n_q): integer dot, masked past `limit`
+        for (t, kp) in self.k_packed.chunks(bpt).take(n_q).enumerate() {
+            if t > limit {
+                continue;
+            }
+            let mut acc = 0i32;
+            for (j, &b) in kp.iter().enumerate() {
+                let lo = ((b as i8) << 4) >> 4; // low nibble, sign-extended
+                let hi = (b as i8) >> 4; // high nibble, sign-extended
+                acc += qc[2 * j] as i32 * lo as i32;
+                acc += qc[2 * j + 1] as i32 * hi as i32;
+            }
+            let s = scale * sq * self.k_scale[t] * acc as f32;
+            scores[t] = s;
+            row_max = row_max.max(s);
+        }
+        // recent f32 tokens [n_q..len): exact dot in the original basis (q·k = qr·kr)
+        for (i, (k, _)) in self.recent.iter().enumerate() {
+            if n_q + i > limit {
+                continue;
+            }
+            let s = scale * q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>();
+            scores[n_q + i] = s;
+            row_max = row_max.max(s);
+        }
+        let mut sum = 0f32;
+        for sc in scores.iter_mut() {
+            let e = (*sc - row_max).exp(); // masked (-inf) → 0
+            *sc = e;
+            sum += e;
+        }
+        let inv = sum.recip();
+        // out = H·(Σ quantized P·V_rot) + Σ recent P·V   (int4 part computed in rotated basis)
+        let mut orot = vec![0f32; d];
+        for (t, &sc) in scores.iter().take(n_q).enumerate() {
+            if sc == 0.0 {
+                continue;
+            }
+            let p = sc * inv;
+            let vp = &self.v_packed[t * bpt..(t + 1) * bpt];
+            let vs = self.v_scale[t];
+            for (j, &b) in vp.iter().enumerate() {
+                let lo = ((b as i8) << 4) >> 4;
+                let hi = (b as i8) >> 4;
+                orot[2 * j] += p * lo as f32 * vs;
+                orot[2 * j + 1] += p * hi as f32 * vs;
+            }
+        }
+        let mut out = self.rotate(&orot);
+        for (i, (_, v)) in self.recent.iter().enumerate() {
+            let p = scores[n_q + i] * inv;
+            if p == 0.0 {
+                continue;
+            }
+            for (o, &vv) in out.iter_mut().zip(v) {
+                *o += p * vv;
+            }
+        }
+        out
+    }
+    pub fn memory_bytes(&self) -> usize {
+        self.k_packed.len()
+            + self.v_packed.len()
+            + (self.k_scale.len() + self.v_scale.len()) * 4
+            + self.recent.len() * self.d * 2 * 4
+    }
+    // Raw store accessors — used by the GPU-validation dumper to feed the Metal kernel the exact
+    // bytes the CPU `attend` reads, so the on-device output can be diffed against this reference.
+    pub fn k_packed(&self) -> &[u8] {
+        &self.k_packed
+    }
+    pub fn v_packed(&self) -> &[u8] {
+        &self.v_packed
+    }
+    pub fn k_scale(&self) -> &[f32] {
+        &self.k_scale
+    }
+    pub fn v_scale(&self) -> &[f32] {
+        &self.v_scale
     }
 }
 
@@ -246,6 +551,13 @@ impl QuantKeyCache {
 pub struct QuantizedKvSdpa {
     pub axis: usize,
     pub scale: Option<f32>,
+    /// Causal masking. Must be set from the fused `Sdpa::is_causal`: for a real causal LM, dropping
+    /// it lets prompt tokens attend to future prompt tokens during a multi-token prefill chunk
+    /// (decode chunks of 1 are unaffected). Required for correct end-to-end use (Milestone 3).
+    pub causal: bool,
+    /// Mixed precision (Milestone 5): keep the newest `n_recent` tokens in exact f32, quantize the
+    /// rest to int4. 0 = pure int4.
+    pub n_recent: usize,
 }
 impl Eq for QuantizedKvSdpa {}
 
@@ -254,7 +566,10 @@ impl Op for QuantizedKvSdpa {
         "QuantizedKvSdpa".into()
     }
     fn info(&self) -> TractResult<Vec<String>> {
-        Ok(vec![format!("axis={}, scale={:?}", self.axis, self.scale)])
+        Ok(vec![format!(
+            "axis={}, scale={:?}, causal={}, n_recent={}",
+            self.axis, self.scale, self.causal, self.n_recent
+        )])
     }
     op_as_typed_op!();
 }
@@ -270,8 +585,9 @@ impl EvalOp for QuantizedKvSdpa {
     ) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(QuantizedKvSdpaState {
             scale: self.scale,
-            k_caches: Vec::new(),
-            v_caches: Vec::new(),
+            causal: self.causal,
+            n_recent: self.n_recent,
+            caches: Vec::new(),
             initialized: false,
         })))
     }
@@ -288,8 +604,9 @@ impl TypedOp for QuantizedKvSdpa {
 #[derive(Clone, Debug)]
 pub struct QuantizedKvSdpaState {
     scale: Option<f32>,
-    k_caches: Vec<QuantKeyCache>,   // one per (batch * kv_head)
-    v_caches: Vec<QuantValueCache>, // one per (batch * kv_head)
+    causal: bool,
+    n_recent: usize,
+    caches: Vec<QuantKvInt4>, // one per (batch * kv_head): int4+Hadamard, exact-f32 recent window
     initialized: bool,
 }
 
@@ -311,39 +628,52 @@ impl OpState for QuantizedKvSdpaState {
         let (b, kh, snew, d) = kv.dim();
         let n = b * kh;
         if !self.initialized {
-            self.k_caches = (0..n).map(|_| QuantKeyCache::new(d)).collect();
-            self.v_caches = (0..n).map(|_| QuantValueCache::new(d)).collect();
+            ensure!(
+                d.is_power_of_two(),
+                "QuantizedKvSdpa int4 path needs head_dim to be a power of two (FWHT), got {d}"
+            );
+            self.caches = (0..n).map(|_| QuantKvInt4::with_recent(d, self.n_recent)).collect();
             self.initialized = true;
         }
-        // Append each new token for each (batch, kv_head).
+        // Append each new token (rotate + per-token int4, or keep in the exact f32 recent window).
         for bi in 0..b {
             for hi in 0..kh {
                 let idx = bi * kh + hi;
                 let ks = kv.slice(s![bi, hi, .., ..]);
                 let vs = vv.slice(s![bi, hi, .., ..]);
                 for t in 0..snew {
-                    self.k_caches[idx].push_token(ks.slice(s![t, ..]).as_slice().unwrap());
-                    self.v_caches[idx].push_token(vs.slice(s![t, ..]).as_slice().unwrap());
+                    self.caches[idx].push_token(
+                        ks.slice(s![t, ..]).as_slice().unwrap(),
+                        vs.slice(s![t, ..]).as_slice().unwrap(),
+                    );
                 }
             }
         }
-        // Build full [B, H, T, D] dequantized K/V for attention.
-        let (_, _, _, _d) = qv.dim();
-        let t = self.k_caches[0].len();
-        let mut k_full = Array4::<f32>::zeros((b, kh, t, d));
-        let mut v_full = Array4::<f32>::zeros((b, kh, t, d));
+        // ── Int4 + Hadamard attention (Milestones 2/5), causal-masked (Milestone 3) ─────────────
+        // Per (batch, query head): score the int4 cache with an integer dot in the Hadamard basis
+        // (recent tokens exact), softmax, P·V, un-rotate — all inside QuantKvInt4, never expanding
+        // the cache to f32. GQA: query head qh reads kv head qh/group. Causal: query si (absolute
+        // position t-sq+si) attends to [0..=t-sq+si]; decode (sq=1) sees all, so masking only bites
+        // on multi-token prefill chunks.
+        let (_, hq, sq, _) = qv.dim();
+        let group = (hq / kh).max(1);
+        let scale = self.scale.unwrap_or((d as f32).recip().sqrt());
+        let t = self.caches[0].len();
+        let mut o = Array4::<f32>::zeros((b, hq, sq, d));
         for bi in 0..b {
-            for hi in 0..kh {
-                let idx = bi * kh + hi;
-                let kd = self.k_caches[idx].dequant_all();
-                let vd = self.v_caches[idx].dequant_all();
-                k_full.slice_mut(s![bi, hi, .., ..]).assign(&kd);
-                v_full.slice_mut(s![bi, hi, .., ..]).assign(&vd);
+            for qh in 0..hq {
+                let cache = &self.caches[bi * kh + qh / group];
+                for si in 0..sq {
+                    let qrow = qv.slice(s![bi, qh, si, ..]);
+                    let lim = if self.causal { t + si - sq } else { t - 1 };
+                    let out_vec = cache.attend_limited(qrow.as_slice().unwrap(), scale, lim);
+                    o.slice_mut(s![bi, qh, si, ..])
+                        .as_slice_mut()
+                        .unwrap()
+                        .copy_from_slice(&out_vec);
+                }
             }
         }
-        // flash_attention_gqa handles GQA (hq >= kh, hq % kh == 0).
-        let flash = FlashSdpaOp { causal: false, scale: self.scale };
-        let o = flash.flash_attention_gqa(qv, k_full.view(), v_full.view(), None);
         Ok(tvec!(o.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
     }
 }
@@ -351,16 +681,18 @@ impl OpState for QuantizedKvSdpaState {
 #[derive(Clone, Debug)]
 struct FrozenQuantizedKvSdpaState {
     scale: Option<f32>,
-    k_caches: Vec<QuantKeyCache>,
-    v_caches: Vec<QuantValueCache>,
+    causal: bool,
+    n_recent: usize,
+    caches: Vec<QuantKvInt4>,
     initialized: bool,
 }
 impl OpStateFreeze for QuantizedKvSdpaState {
     fn freeze(&self) -> Box<dyn FrozenOpState> {
         Box::new(FrozenQuantizedKvSdpaState {
             scale: self.scale,
-            k_caches: self.k_caches.clone(),
-            v_caches: self.v_caches.clone(),
+            causal: self.causal,
+            n_recent: self.n_recent,
+            caches: self.caches.clone(),
             initialized: self.initialized,
         })
     }
@@ -369,8 +701,9 @@ impl FrozenOpState for FrozenQuantizedKvSdpaState {
     fn unfreeze(&self) -> Box<dyn OpState> {
         Box::new(QuantizedKvSdpaState {
             scale: self.scale,
-            k_caches: self.k_caches.clone(),
-            v_caches: self.v_caches.clone(),
+            causal: self.causal,
+            n_recent: self.n_recent,
+            caches: self.caches.clone(),
             initialized: self.initialized,
         })
     }
@@ -407,7 +740,7 @@ pub fn fuse_quantized_kv_sdpa_rule(
     let taps = patch.taps(model, &[node.inputs[0], k_node.inputs[0], v_node.inputs[0]])?;
     let fused = patch.wire_node(
         format!("{node_name}.quant_kv_sdpa"),
-        QuantizedKvSdpa { axis: kc.axis, scale },
+        QuantizedKvSdpa { axis: kc.axis, scale, causal: op.is_causal, n_recent: 0 },
         &taps,
     )?;
     patch.shunt_outside(model, node.id.into(), fused[0])?;
@@ -570,7 +903,11 @@ mod tests {
         let q = model.add_source("q", f32::fact(&f))?;
         let k = model.add_source("k", f32::fact(&f))?;
         let v = model.add_source("v", f32::fact(&f))?;
-        let o = model.wire_node("qkv", QuantizedKvSdpa { axis: 2, scale: None }, &[q, k, v])?;
+        let o = model.wire_node(
+            "qkv",
+            QuantizedKvSdpa { axis: 2, scale: None, causal: false, n_recent: 0 },
+            &[q, k, v],
+        )?;
         model.select_output_outlets(&o)?;
         let mut rt = model.into_runnable()?.spawn()?;
 
@@ -634,6 +971,72 @@ mod tests {
                 .close_enough(&o_ref, Approximation::SuperApproximate)
                 .with_context(|| format!("quantized decode too far from f32 at step {t}"))?;
         }
+        Ok(())
+    }
+
+    // Milestone-3 causality: in a 2-token prefill, causal query position 0 attends to ONLY token 0
+    // (single-element softmax = 1), so its output must equal token 0's V (within int8). The
+    // non-causal op mixes in token 1 and must differ. Decoupled from the per-channel K running-scale
+    // because a one-element softmax weights that token at 1.0 regardless of its score.
+    #[test]
+    fn causal_masks_future_tokens() -> TractResult<()> {
+        let (b, h, d) = (1usize, 2usize, 16usize);
+        let run = |causal: bool, q: &Tensor, k: &Tensor, v: &Tensor| -> TractResult<Tensor> {
+            let mut model = TypedModel::default();
+            let s = model.sym("S");
+            let f: TVec<TDim> = tvec![b.to_dim(), h.to_dim(), s.into(), d.to_dim()];
+            let qn = model.add_source("q", f32::fact(&f))?;
+            let kn = model.add_source("k", f32::fact(&f))?;
+            let vn = model.add_source("v", f32::fact(&f))?;
+            let o = model.wire_node(
+                "qkv",
+                QuantizedKvSdpa { axis: 2, scale: None, causal, n_recent: 0 },
+                &[qn, kn, vn],
+            )?;
+            model.select_output_outlets(&o)?;
+            Ok(model
+                .into_runnable()?
+                .run(tvec![q.clone().into(), k.clone().into(), v.clone().into()])?
+                .remove(0)
+                .into_tensor())
+        };
+        // two-token prefill; V differs sharply between token 0 and token 1
+        let mk = |f: &dyn Fn(usize, usize) -> f32| -> Tensor {
+            let mut data = vec![0f32; b * h * 2 * d];
+            for hd in 0..h {
+                for tk in 0..2 {
+                    for e in 0..d {
+                        data[(hd * 2 + tk) * d + e] = f(tk, e);
+                    }
+                }
+            }
+            Tensor::from_shape(&[b, h, 2, d], &data).unwrap()
+        };
+        let q = mk(&|tk, e| 0.2 + 0.1 * tk as f32 + (e as f32 * 0.07).sin());
+        let k = mk(&|tk, e| 0.5 * (tk as f32 + 1.0) + (e as f32 * 0.05).cos());
+        let v = mk(&|tk, e| if tk == 0 { 0.4 + 0.01 * e as f32 } else { -0.6 });
+
+        let o_causal = run(true, &q, &k, &v)?;
+        let o_plain = run(false, &q, &k, &v)?;
+        let oc = o_causal.to_plain_array_view::<f32>()?.into_dimensionality::<Ix4>()?;
+        let op = o_plain.to_plain_array_view::<f32>()?.into_dimensionality::<Ix4>()?;
+        let vv = v.to_plain_array_view::<f32>()?.into_dimensionality::<Ix4>()?;
+        // causal position-0 output ≈ token-0 V (int8); non-causal differs
+        let mut causal_err = 0f32;
+        let mut plain_gap = 0f32;
+        for hd in 0..h {
+            for e in 0..d {
+                causal_err = causal_err.max((oc[[0, hd, 0, e]] - vv[[0, hd, 0, e]]).abs());
+                plain_gap = plain_gap.max((op[[0, hd, 0, e]] - vv[[0, hd, 0, e]]).abs());
+            }
+        }
+        println!("  causal pos-0 err={causal_err:.4} (≈int4 noise); non-causal gap={plain_gap:.4}");
+        // causal pos-0 ≈ token-0 V within int4 quant noise; non-causal mixes token-1 and is far off.
+        assert!(causal_err < 0.2, "causal pos-0 must ≈ token-0 V (int4), err {causal_err}");
+        assert!(
+            causal_err < plain_gap * 0.3,
+            "causal must be far closer to token-0 V than non-causal: {causal_err} vs {plain_gap}"
+        );
         Ok(())
     }
 
@@ -715,8 +1118,11 @@ mod tests {
         let q = model.add_source("q", f32::fact(&f))?;
         let k = model.add_source("k", f32::fact(&f))?;
         let v = model.add_source("v", f32::fact(&f))?;
-        let o =
-            model.wire_node("qkv", QuantizedKvSdpa { axis: 2, scale: Some(0.125) }, &[q, k, v])?;
+        let o = model.wire_node(
+            "qkv",
+            QuantizedKvSdpa { axis: 2, scale: Some(0.125), causal: false, n_recent: 0 },
+            &[q, k, v],
+        )?;
         model.select_output_outlets(&o)?;
 
         let nnef = tract_nnef::nnef().with_tract_transformers();
@@ -733,5 +1139,431 @@ mod tests {
         assert_eq!(op.axis, 2);
         assert_eq!(op.scale, Some(0.125));
         Ok(())
+    }
+
+    // ─── Hadamard-rotated int4 KV: the A/B against plain KIVI ──────────────────────────────
+    // Rotation only helps where outlier channels exist (real K caches have them; uniform-random
+    // synthetic data does not). So this fixture *plants* outlier channels in K — the documented
+    // "massive activation" phenomenon — and measures whether a fixed Hadamard lets int4 recover
+    // toward int8 quality. Layout is KIVI: K per-channel, V per-token.
+    use tract_nnef::tract_ndarray::{Array1, Array2 as A2};
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+
+    /// One head of synthetic K with `n_outlier` high-magnitude outlier channels (×`mag`),
+    /// plus a flat V. Returns (q[D], k[S,D], v[S,D]).
+    fn head_with_outliers(
+        s: usize,
+        d: usize,
+        n_outlier: usize,
+        mag: f32,
+        seed: &mut u64,
+    ) -> (Array1<f32>, A2<f32>, A2<f32>) {
+        let q = Array1::from_shape_fn(d, |_| lcg(seed));
+        let mut k = A2::from_shape_fn((s, d), |_| lcg(seed) * 0.5);
+        let v = A2::from_shape_fn((s, d), |_| lcg(seed) * 0.5);
+        for c in 0..n_outlier.min(d) {
+            for t in 0..s {
+                // a big, token-varying value concentrated in a few channels
+                k[(t, c)] = mag * (lcg(seed) + if t % 2 == 0 { 1.0 } else { -1.0 });
+            }
+        }
+        (q, k, v)
+    }
+
+    fn softmax_inplace(x: &mut [f32]) {
+        let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        x.iter_mut().for_each(|v| {
+            *v = (*v - m).exp();
+            sum += *v;
+        });
+        x.iter_mut().for_each(|v| *v /= sum);
+    }
+
+    fn attn_ref(q: &Array1<f32>, k: &A2<f32>, v: &A2<f32>) -> Array1<f32> {
+        let (s, d) = k.dim();
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut sc: Vec<f32> = (0..s).map(|j| k.row(j).dot(q) * scale).collect();
+        softmax_inplace(&mut sc);
+        let mut out = Array1::<f32>::zeros(d);
+        for j in 0..s {
+            for e in 0..d {
+                out[e] += sc[j] * v[(j, e)];
+            }
+        }
+        out
+    }
+
+    /// Attention through a quantized cache. `rot=Some(H)` rotates K (+matching Q) and V by H,
+    /// quantizes in the rotated basis, then un-rotates the V output. `k_per_token` picks the K
+    /// scale layout: `false` = per-channel (KIVI, isolates outlier channels but needs a running
+    /// per-channel scale that goes stale on a growing cache); `true` = per-token (self-contained,
+    /// no staleness — but collapses without help on outlier channels).
+    fn attn_quant(
+        q: &Array1<f32>,
+        k: &A2<f32>,
+        v: &A2<f32>,
+        bits: u32,
+        rot: Option<&A2<f32>>,
+        k_per_token: bool,
+    ) -> Array1<f32> {
+        let (s, d) = k.dim();
+        let scale = 1.0 / (d as f32).sqrt();
+        let (k_src, q_row, v_src) = match rot {
+            Some(h) => (k.dot(h), h.t().dot(q), v.dot(h)),
+            None => (k.clone(), q.clone(), v.clone()),
+        };
+        let k_dq = quant_dequant(k_src.view(), bits, k_per_token); // by_row=true ⇒ per-token
+        let v_dq = quant_dequant(v_src.view(), bits, true); // per-token   (Values)
+        let mut sc: Vec<f32> = (0..s).map(|j| k_dq.row(j).dot(&q_row) * scale).collect();
+        softmax_inplace(&mut sc);
+        let mut out = Array1::<f32>::zeros(d);
+        for j in 0..s {
+            for e in 0..d {
+                out[e] += sc[j] * v_dq[(j, e)];
+            }
+        }
+        match rot {
+            Some(h) => h.dot(&out), // un-rotate V output (H symmetric ⇒ H·Hᵀ = I)
+            None => out,
+        }
+    }
+
+    fn rel_dev(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+        let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+        let den: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        num / den.max(1e-9)
+    }
+
+    // Robust invariants of the KIVI cache (data-independent): int8 per-channel is near-lossless,
+    // and int4 stays usable. The *rotation* question is data-dependent and answered on real K/V,
+    // not here — see harness/kv_quant_hadamard.py: on real GPT-2, a fixed Hadamard is a modest int4
+    // win on the deeper layers (best as per-channel+Hadamard; and it rescues the staleness-free
+    // per-token layout to match per-channel KIVI), but it is NOT a path to int2 — sub-4-bit needs
+    // the mixed-precision sink/recent window, independent of rotation. Synthetic outliers (the
+    // `bench_hadamard_int4` table) do NOT reproduce that win, which is why the call is made on real
+    // tensors. The Hadamard primitive (`hadamard_normalized`) and its round-trip are verified below.
+    #[test]
+    fn kivi_int8_near_lossless_int4_usable() {
+        let (heads, s, d) = (8usize, 96usize, 64usize);
+        let mut seed = 0x1234_5678u64;
+        let (mut pc8, mut pc4) = (0.0f32, 0.0f32);
+        for _ in 0..heads {
+            let (q, k, v) = head_with_outliers(s, d, 3, 25.0, &mut seed);
+            let r = attn_ref(&q, &k, &v);
+            pc8 += rel_dev(&attn_quant(&q, &k, &v, 8, None, false), &r);
+            pc4 += rel_dev(&attn_quant(&q, &k, &v, 4, None, false), &r);
+        }
+        let (pc8, pc4) = (pc8 / heads as f32, pc4 / heads as f32);
+        println!("  int8 perCh={pc8:.4}  int4 perCh(KIVI)={pc4:.4}");
+        assert!(pc8 < 0.03, "int8 per-channel KIVI should be near-lossless, got {pc8}");
+        assert!(pc4 < 0.20, "int4 per-channel KIVI should stay usable on outliers, got {pc4}");
+    }
+
+    // FWHT must equal the dense Hadamard matmul (x·H), so swapping it in is exact, just O(D log D).
+    #[test]
+    fn fwht_matches_dense_hadamard() {
+        for &d in &[2usize, 8, 64, 128] {
+            let h = hadamard_normalized(d);
+            let mut seed = 3u64;
+            let x: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+            let dense: Vec<f32> =
+                (0..d).map(|m| (0..d).map(|k| x[k] * h[(k, m)]).sum::<f32>()).collect();
+            let mut fast = x.clone();
+            fwht_normalized(&mut fast);
+            let maxerr = dense.iter().zip(&fast).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(maxerr < 1e-4, "FWHT != dense Hadamard for d={d}, maxerr {maxerr}");
+        }
+    }
+
+    // Alloc-avoidance must be LOSSLESS: the fused quantize+pack has to be byte-identical to the
+    // original quant_sym + two-per-byte pack (and bit-identical scale), or it's reverted.
+    #[test]
+    fn quant_pack_i4_is_bit_identical() {
+        let mut seed = 0xABCDu64;
+        for _ in 0..64 {
+            let d = 64usize;
+            // include large/outlier values to exercise clamping + the full code range
+            let x: Vec<f32> =
+                (0..d).map(|_| lcg(&mut seed) * (1.0 + 20.0 * lcg(&mut seed).abs())).collect();
+            let (codes, s_ref) = quant_sym(&x, 7);
+            let mut packed_ref = vec![0u8; codes.len().div_ceil(2)];
+            for (i, &c) in codes.iter().enumerate() {
+                let nib = (c as u8) & 0x0F;
+                if i % 2 == 0 {
+                    packed_ref[i / 2] |= nib;
+                } else {
+                    packed_ref[i / 2] |= nib << 4;
+                }
+            }
+            let mut packed_new = Vec::new();
+            let s_new = quant_pack_i4(&x, &mut packed_new);
+            assert_eq!(s_ref.to_bits(), s_new.to_bits(), "scale not bit-identical");
+            assert_eq!(packed_ref, packed_new, "packed bytes not byte-identical");
+        }
+    }
+
+    // Milestone-2 correctness: full int4+Hadamard attention (integer score dot) on data with
+    // outlier K channels stays close to f32. This is the layout that banks the speed.
+    #[test]
+    fn int4_hadamard_attention_matches_f32() {
+        let (t, d) = (48usize, 64usize);
+        let mut seed = 11u64;
+        let mut cache = QuantKvInt4::new(d);
+        let (mut ks, mut vs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (vec![], vec![]);
+        for _ in 0..t {
+            let mut k: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
+            for kk in k.iter_mut().take(3) {
+                *kk = 20.0 * lcg(&mut seed); // outlier channels
+            }
+            let v: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
+            cache.push_token(&k, &v);
+            ks.push(k);
+            vs.push(v);
+        }
+        let q: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+        let scale = 1.0 / (d as f32).sqrt();
+        // f32 reference
+        let mut sc: Vec<f32> =
+            (0..t).map(|j| scale * (0..d).map(|e| q[e] * ks[j][e]).sum::<f32>()).collect();
+        let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum = 0.0;
+        sc.iter_mut().for_each(|x| {
+            *x = (*x - m).exp();
+            sum += *x;
+        });
+        let mut refo = vec![0f32; d];
+        for j in 0..t {
+            let p = sc[j] / sum;
+            for e in 0..d {
+                refo[e] += p * vs[j][e];
+            }
+        }
+        let got = cache.attend(&q, scale);
+        let num: f32 = got.iter().zip(&refo).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        let den: f32 = refo.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let rel = num / den.max(1e-9);
+        println!(
+            "  int4+Hadamard attention rel-dev vs f32 = {rel:.4}  (mem {} B)",
+            cache.memory_bytes()
+        );
+        assert!(rel < 0.15, "int4+Hadamard should stay within 15% of f32 on outliers, got {rel}");
+    }
+
+    // Milestone-5: the exact-f32 recent window reduces error vs pure int4, and a full window is
+    // exact. Proves mixed precision works — the lever for pushing the body below int4.
+    #[test]
+    fn recent_window_improves_accuracy() {
+        let (t, d) = (64usize, 64usize);
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut seed = 19u64;
+        let (mut ks, mut vs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (vec![], vec![]);
+        for _ in 0..t {
+            let mut k: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
+            for kk in k.iter_mut().take(3) {
+                *kk = 22.0 * lcg(&mut seed);
+            }
+            ks.push(k);
+            vs.push((0..d).map(|_| lcg(&mut seed) * 0.5).collect());
+        }
+        let q: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+        // f32 reference
+        let mut sc: Vec<f32> =
+            (0..t).map(|j| scale * (0..d).map(|e| q[e] * ks[j][e]).sum::<f32>()).collect();
+        let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum = 0.0;
+        sc.iter_mut().for_each(|x| {
+            *x = (*x - m).exp();
+            sum += *x;
+        });
+        let mut refo = vec![0f32; d];
+        for j in 0..t {
+            let p = sc[j] / sum;
+            for e in 0..d {
+                refo[e] += p * vs[j][e];
+            }
+        }
+        let dev = |n_recent: usize| -> f32 {
+            let mut c = QuantKvInt4::with_recent(d, n_recent);
+            for j in 0..t {
+                c.push_token(&ks[j], &vs[j]);
+            }
+            let got = c.attend(&q, scale);
+            let num: f32 = got.iter().zip(&refo).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+            num / refo.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9)
+        };
+        let (d0, d16, dfull) = (dev(0), dev(16), dev(t));
+        println!("  rel-dev:  pure-int4={d0:.4}  recent16={d16:.4}  full-f32={dfull:.5}");
+        assert!(d16 <= d0 + 1e-6, "recent window must not worsen accuracy: {d16} vs {d0}");
+        assert!(dfull < 1e-4, "full window must be exact f32, got {dfull}");
+    }
+
+    // Measured microbench: int4 attention (Milestone-2 path) vs f32 streaming, per-query time at
+    // growing context. The int path reads ¼ the K/V bytes and scores with an integer dot.
+    //   cargo test -p tract-transformers kv_quant::tests::bench_int4_vs_f32_attention -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_int4_vs_f32_attention() {
+        let d = 128usize;
+        let scale = 1.0 / (d as f32).sqrt();
+        println!("\n  Single-query attention latency, D={d}: f32 streaming vs int4+Hadamard");
+        println!("     T  | f32 µs/q | int4 µs/q | speedup | f32 KV(KB) | int4 KV(KB)");
+        for &t in &[256usize, 1024, 2048, 4096] {
+            let mut seed = 5u64;
+            let mut int4 = QuantKvInt4::new(d);
+            let mut kf: Vec<Vec<f32>> = Vec::with_capacity(t);
+            let mut vf: Vec<Vec<f32>> = Vec::with_capacity(t);
+            for _ in 0..t {
+                let mut k: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
+                for kk in k.iter_mut().take(4) {
+                    *kk = 18.0 * lcg(&mut seed);
+                }
+                let v: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
+                int4.push_token(&k, &v);
+                kf.push(k);
+                vf.push(v);
+            }
+            let q: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+            let reps = 200;
+            // f32 streaming attention (reads f32 K/V, f32 dot) — the baseline this must beat.
+            let f32_attend = || {
+                let mut scores = vec![0f32; t];
+                let mut mx = f32::NEG_INFINITY;
+                for (j, s) in scores.iter_mut().enumerate() {
+                    let d_: f32 = (0..d).map(|e| q[e] * kf[j][e]).sum::<f32>() * scale;
+                    *s = d_;
+                    mx = mx.max(d_);
+                }
+                let mut sum = 0.0;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                let inv = sum.recip();
+                let mut o = vec![0f32; d];
+                for (j, s) in scores.iter().enumerate() {
+                    let p = s * inv;
+                    for e in 0..d {
+                        o[e] += p * vf[j][e];
+                    }
+                }
+                o[0]
+            };
+            let t0 = std::time::Instant::now();
+            let mut sink = 0f32;
+            for _ in 0..reps {
+                sink += f32_attend();
+            }
+            let f32_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+            let t1 = std::time::Instant::now();
+            for _ in 0..reps {
+                sink += int4.attend(&q, scale)[0];
+            }
+            let int4_us = t1.elapsed().as_secs_f64() * 1e6 / reps as f64;
+            std::hint::black_box(sink);
+            let f32_kb = (t * d * 4 * 2) as f64 / 1024.0;
+            let int4_kb = int4.memory_bytes() as f64 / 1024.0;
+            println!(
+                "  {t:>5} | {f32_us:>8.1} | {int4_us:>9.1} | {:>6.2}x | {f32_kb:>10.1} | {int4_kb:>10.1}",
+                f32_us / int4_us
+            );
+        }
+    }
+
+    // Milestone-1 guard: the streaming primitives (score_with / accumulate_into) must produce the
+    // same numbers as the dequant-all path they replace, so the fused eval stays bit-faithful to
+    // the prior behavior while never materializing the full f32 cache.
+    #[test]
+    fn streaming_primitives_match_dequant_all() {
+        let (t, d) = (20usize, 16usize);
+        let mut kc = QuantKeyCache::new(d);
+        let mut vc = QuantValueCache::new(d);
+        let mut seed = 7u64;
+        for _ in 0..t {
+            kc.push_token(&(0..d).map(|_| lcg(&mut seed)).collect::<Vec<_>>());
+            vc.push_token(&(0..d).map(|_| lcg(&mut seed)).collect::<Vec<_>>());
+        }
+        let q: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+        let kd = kc.dequant_all();
+        let vd = vc.dequant_all();
+        for tt in 0..t {
+            let want: f32 = (0..d).map(|j| q[j] * kd[(tt, j)]).sum();
+            assert!((kc.score_with(tt, &q) - want).abs() < 1e-3, "score_with mismatch at t={tt}");
+        }
+        let p = 0.37f32;
+        let mut acc = vec![0f32; d];
+        vc.accumulate_into(5, p, &mut acc);
+        for j in 0..d {
+            assert!((acc[j] - p * vd[(5, j)]).abs() < 1e-4, "accumulate_into mismatch at j={j}");
+        }
+    }
+
+    // The Hadamard is an orthonormal involution: H·H = I and Hᵀ = H. (So the same matrix rotates
+    // K/V into the spread basis and un-rotates the V output — the property attn_quant relies on.)
+    #[test]
+    fn hadamard_is_orthonormal_involution() {
+        for &n in &[2usize, 8, 64, 128] {
+            let h = hadamard_normalized(n);
+            let hh = h.dot(&h);
+            let mut max_off = 0.0f32;
+            for i in 0..n {
+                for j in 0..n {
+                    let expect = if i == j { 1.0 } else { 0.0 };
+                    max_off = max_off.max((hh[(i, j)] - expect).abs());
+                }
+            }
+            assert!(max_off < 1e-4, "H·H must be identity for n={n}, max dev {max_off}");
+        }
+    }
+
+    // Full A/B table: bit-widths × outlier-magnitude sweep, both K layouts ± Hadamard.
+    //   cargo test -p tract-transformers kv_quant::tests::bench_hadamard_int4 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_hadamard_int4() {
+        let (heads, s, d) = (8usize, 128usize, 64usize);
+        let h = hadamard_normalized(d);
+        println!("\n  Attention rel-deviation vs full-f32 (lower=better), D={d}, S={s}");
+        println!("  V always per-token; 3 of {d} K channels are outliers, magnitude swept.\n");
+        println!("       |        int4 Keys              |        int2 Keys");
+        println!(
+            "   mag | perCh | perTok | perTok+Hada | perCh | perTok | perTok+Hada | perCh+Hada(int4)"
+        );
+        for &mag in &[0.0f32, 5.0, 15.0, 40.0] {
+            let mut seed = 0xABCD_1234u64;
+            let mut acc = [0.0f32; 7];
+            for _ in 0..heads {
+                let (q, k, v) = head_with_outliers(s, d, 3, mag, &mut seed);
+                let r = attn_ref(&q, &k, &v);
+                acc[0] += rel_dev(&attn_quant(&q, &k, &v, 4, None, false), &r);
+                acc[1] += rel_dev(&attn_quant(&q, &k, &v, 4, None, true), &r);
+                acc[2] += rel_dev(&attn_quant(&q, &k, &v, 4, Some(&h), true), &r);
+                acc[3] += rel_dev(&attn_quant(&q, &k, &v, 2, None, false), &r);
+                acc[4] += rel_dev(&attn_quant(&q, &k, &v, 2, None, true), &r);
+                acc[5] += rel_dev(&attn_quant(&q, &k, &v, 2, Some(&h), true), &r);
+                acc[6] += rel_dev(&attn_quant(&q, &k, &v, 4, Some(&h), false), &r);
+            }
+            for a in acc.iter_mut() {
+                *a /= heads as f32;
+            }
+            println!(
+                "  {mag:>4.0} | {:.3} | {:.3}  |   {:.3}     | {:.3} | {:.3}  |   {:.3}     |   {:.3}",
+                acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6]
+            );
+        }
+        println!("\n  Read-out:");
+        println!(
+            "  • per-channel K already handles outliers — Hadamard on it is redundant (see last col)."
+        );
+        println!(
+            "  • per-token K collapses on outliers but Hadamard rescues it → the staleness-free layout."
+        );
+        println!(
+            "  • gap widens at int2 and with outlier magnitude — the TurboQuant/OSCAR regime."
+        );
     }
 }
