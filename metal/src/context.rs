@@ -22,6 +22,7 @@ use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Function,
     FunctionConstantValues, Library, MTLResourceOptions,
 };
+use std::cell::Cell;
 use std::collections::HashMap;
 use tract_core::internal::*;
 
@@ -288,6 +289,12 @@ pub struct MetalStream {
     command_buffer: RefCell<Option<TCommandBuffer>>,
     command_buffer_id: AtomicUsize,
     retained_tensors: RefCell<Vec<DeviceTensor>>,
+    /// Scratch tensors handed out by `transient_tensor`, with the command
+    /// buffer generation they were last issued in.
+    transient_pool: RefCell<HashMap<(DatumType, usize), Vec<(DeviceTensor, u64)>>>,
+    /// Bumped when a command buffer completes, so scratch issued before it is
+    /// known to be free.
+    generation: Cell<u64>,
 }
 
 impl Default for MetalStream {
@@ -297,6 +304,9 @@ impl Default for MetalStream {
 }
 
 impl MetalStream {
+    /// Scratch slots kept per (dtype, element count).
+    const TRANSIENT_POOL_DEPTH: usize = 4;
+
     pub fn new() -> Self {
         let context = metal_context();
         let command_queue = context.device.new_command_queue();
@@ -306,6 +316,8 @@ impl MetalStream {
             command_buffer: RefCell::new(None),
             command_buffer_id: AtomicUsize::new(0),
             retained_tensors: RefCell::new(vec![]),
+            transient_pool: RefCell::new(HashMap::new()),
+            generation: Cell::new(0),
         }
     }
 
@@ -328,6 +340,33 @@ impl MetalStream {
         constants: Option<ConstantValues>,
     ) -> TractResult<ComputePipelineState> {
         self.context.load_pipeline_with_constants(library_name, func_name, constants)
+    }
+
+
+    /// Scratch tensor for the duration of a dispatch. Wrapping host memory in a
+    /// new `MTLBuffer` costs a few microseconds whatever the size, so scratch is
+    /// pooled and reissued once the command buffer it was used in has
+    /// completed — the same point at which the stream releases the tensors that
+    /// dispatch retained.
+    pub fn transient_tensor(&self, dt: DatumType, shape: &[usize]) -> TractResult<DeviceTensor> {
+        let len = shape.iter().product::<usize>();
+        let current = self.generation.get();
+        let mut pool = self.transient_pool.borrow_mut();
+        let slots = pool.entry((dt, len)).or_default();
+        if let Some(slot) = slots.iter_mut().find(|(t, g)| *g < current && t.shape() == shape) {
+            slot.1 = current;
+            return Ok(slot.0.clone());
+        }
+        let fresh = unsafe { DeviceTensor::uninitialized_dt(dt, shape)? };
+        if slots.len() < Self::TRANSIENT_POOL_DEPTH {
+            slots.push((fresh.clone(), current));
+        }
+        Ok(fresh)
+    }
+
+    /// Drop every pooled scratch tensor.
+    pub fn clear_transient_pool(&self) {
+        self.transient_pool.borrow_mut().clear();
     }
 
     pub fn retain_tensor(&self, tensor: &DeviceTensor) {
@@ -364,6 +403,7 @@ impl MetalStream {
 
         // Clear local retained values used by the command buffer
         self.retained_tensors.borrow_mut().clear();
+        self.generation.set(self.generation.get() + 1);
 
         *self.command_buffer.borrow_mut() = None;
         Ok(())

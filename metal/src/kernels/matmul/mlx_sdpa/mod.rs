@@ -226,9 +226,9 @@ fn dispatch_sdpa_vector_2pass(
 ) -> TractResult<()> {
     let mask_strides = mask.map(|m| mask_bhqk_strides(m, hq, ql, kl)).transpose()?;
     let blocks = TWO_PASS_BLOCKS as usize;
-    let partials = unsafe { DeviceTensor::uninitialized_dt(dt, &[b, hq, ql, blocks, d])? };
-    let sums = unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[b, hq, ql, blocks])? };
-    let maxs = unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[b, hq, ql, blocks])? };
+    let partials = stream.transient_tensor(dt, &[b, hq, ql, blocks, d])?;
+    let sums = stream.transient_tensor(f32::datum_type(), &[b, hq, ql, blocks])?;
+    let maxs = stream.transient_tensor(f32::datum_type(), &[b, hq, ql, blocks])?;
     stream.retain_tensor(&partials);
     stream.retain_tensor(&sums);
     stream.retain_tensor(&maxs);
