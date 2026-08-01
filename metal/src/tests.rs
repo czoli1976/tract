@@ -834,6 +834,68 @@ mod tests {
         Ok(())
     }
 
+    // Query-length sweep at a long cache: where does the decode kernel stop
+    // taking the query and hand over to the tiled path?
+    //   cargo test -p tract-metal bench_sdpa_qlen_cliff -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_sdpa_qlen_cliff() -> TractResult<()> {
+        use crate::kernels::matmul::mlx_sdpa::MetalMlxSdpa;
+        use std::time::Instant;
+        let dim = |x: usize| TDim::from(x as i64);
+        let dt = f16::datum_type();
+        let (hq, hkv, d) = (32usize, 8usize, 128usize);
+        for kl in [4096usize, 16384] {
+            println!("\n  f16 GQA {hq}/{hkv} D={d} kvL={kl}");
+            println!("    qL   ms/dispatch   kernel");
+            for ql in [1usize, 4, 8, 9, 12, 16, 24, 32] {
+                let qf = dt.fact(tvec![dim(1), dim(hq), dim(ql), dim(d)]);
+                let ramp = |sh: &[usize]| -> TractResult<Tensor> {
+                    let len: usize = sh.iter().product();
+                    let v: Vec<f32> = (0..len).map(|i| ((i % 37) as f32 - 18.0) / 32.0).collect();
+                    Ok(Tensor::from_shape(sh, &v)?.cast_to_dt(dt)?.into_owned())
+                };
+                let kv = ramp(&[1, hkv, kl, d])?;
+                let mut m = TypedModel::default();
+                let q = m.add_source("q", qf)?;
+                let k = m.add_const("k", kv.clone())?;
+                let v = m.add_const("v", kv)?;
+                let out = m.wire_node(
+                    "sdpa",
+                    tract_transformers::ops::sdpa::Sdpa {
+                        scale: None,
+                        datum_type: dt,
+                        acc_datum_type: f32::datum_type(),
+                        is_causal: false,
+                    },
+                    &[q, k, v],
+                )?;
+                m.select_output_outlets(&out)?;
+                let m = MetalTransform::default().transform_into(m)?;
+                let fused = m.nodes().iter().any(|n| n.op_is::<MetalMlxSdpa>());
+                let r = m.into_runnable()?;
+                let qv: TVec<TValue> = tvec![ramp(&[1, hq, ql, d])?.into_tvalue()];
+                for _ in 0..3 {
+                    r.run(qv.clone())?;
+                }
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    for _ in 0..10 {
+                        r.run(qv.clone())?;
+                    }
+                    best = best.min(t.elapsed().as_secs_f64() / 10.0);
+                }
+                println!(
+                    "    {ql:<4} {:10.4}   {}",
+                    best * 1e3,
+                    if fused { "fused" } else { "explode" }
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn bool_bitor_matches_cpu_on_metal() -> TractResult<()> {
         use tract_core::ops::logic::bitor;
