@@ -834,6 +834,91 @@ mod tests {
         Ok(())
     }
 
+    // What the explode path spends on generating and materializing a causal
+    // mask, versus being handed the same mask as an input.
+    //   cargo test -p tract-metal bench_causal_mask_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_causal_mask_cost() -> TractResult<()> {
+        use std::time::Instant;
+        let dim = |x: usize| TDim::from(x as i64);
+        let dt = f32::datum_type();
+        // D=96 is in no steel set, so a multi-row query explodes
+        let (h, d) = (8usize, 96usize);
+        for s in [256usize, 512, 1024] {
+            let ramp = |sh: &[usize]| -> TractResult<Tensor> {
+                let len: usize = sh.iter().product();
+                let v: Vec<f32> = (0..len).map(|i| ((i % 37) as f32 - 18.0) / 32.0).collect();
+                Ok(Tensor::from_shape(sh, &v)?.cast_to_dt(dt)?.into_owned())
+            };
+            let qf = dt.fact(tvec![dim(1), dim(h), dim(s), dim(d)]);
+            let mk = |causal: bool| -> TractResult<TypedModel> {
+                let mut m = TypedModel::default();
+                let q = m.add_source("q", qf.clone())?;
+                let k = m.add_const("k", ramp(&[1, h, s, d])?)?;
+                let v = m.add_const("v", ramp(&[1, h, s, d])?)?;
+                let mut ins = vec![q, k, v];
+                if !causal {
+                    let mut mask = vec![0f32; s * s];
+                    for i in 0..s {
+                        for j in (i + 1)..s {
+                            mask[i * s + j] = -1e30;
+                        }
+                    }
+                    ins.push(m.add_const("mask", Tensor::from_shape(&[1, 1, s, s], &mask)?)?);
+                }
+                let out = m.wire_node(
+                    "sdpa",
+                    tract_transformers::ops::sdpa::Sdpa {
+                        scale: None,
+                        datum_type: dt,
+                        acc_datum_type: dt,
+                        is_causal: causal,
+                    },
+                    &ins,
+                )?;
+                m.select_output_outlets(&out)?;
+                MetalTransform::default().transform_into(m)
+            };
+            let gen_m = mk(true)?;
+            let given_m = mk(false)?;
+            let nodes = |m: &TypedModel| m.nodes().len();
+            let (ng, nv) = (nodes(&gen_m), nodes(&given_m));
+            let generated = gen_m.into_runnable()?;
+            let given = given_m.into_runnable()?;
+            let qv: TVec<TValue> = tvec![ramp(&[1, h, s, d])?.into_tvalue()];
+            let bench = |f: &dyn Fn() -> TractResult<()>| -> TractResult<f64> {
+                for _ in 0..3 {
+                    f()?;
+                }
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    for _ in 0..10 {
+                        f()?;
+                    }
+                    best = best.min(t.elapsed().as_secs_f64() / 10.0);
+                }
+                Ok(best)
+            };
+            let g = bench(&|| {
+                generated.run(qv.clone())?;
+                Ok(())
+            })?;
+            let v = bench(&|| {
+                given.run(qv.clone())?;
+                Ok(())
+            })?;
+            println!(
+                "  S={s:<5} mask generated {:8.4} ms ({ng} nodes)   mask given {:8.4} ms ({nv} nodes)   overhead {:5.1}%",
+                g * 1e3,
+                v * 1e3,
+                (g / v - 1.0) * 100.0
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn bool_bitor_matches_cpu_on_metal() -> TractResult<()> {
         use tract_core::ops::logic::bitor;
