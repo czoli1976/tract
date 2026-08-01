@@ -408,3 +408,186 @@ pub fn dispatch_mlx_depthwise_conv_2d(
     });
     Ok(())
 }
+
+/// Whether the ported Winograd path applies: 3×3 stride-1 dilation-1, channel
+/// counts a multiple of 32 both ways, and an input large enough to pay for the
+/// transforms — mlx's own gate.
+pub fn mlx_winograd_eligible(op: &Conv, in_facts: &[&TypedFact]) -> bool {
+    if !mlx_conv_eligible(op, in_facts) {
+        return false;
+    }
+    // F(6x6, 3x3) is too ill-conditioned to run in half precision: measured
+    // against the CPU op it lands at ~17% relative error, so f16 keeps the
+    // implicit-GEMM path.
+    if in_facts[0].datum_type != DatumType::F32 {
+        return false;
+    }
+    let (c, o) = (op.pool_spec.input_channels, op.pool_spec.output_channels);
+    if !c.is_multiple_of(32) || !o.is_multiple_of(32) || c + o < 256 {
+        return false;
+    }
+    if op.pool_spec.kernel_shape.as_slice() != [3, 3] {
+        return false;
+    }
+    if op.pool_spec.strides().iter().any(|&s| s != 1)
+        || op.pool_spec.dilations().iter().any(|&d| d != 1)
+    {
+        return false;
+    }
+    let Ok(shape) = op.pool_spec.data_format.shape(in_facts[0].shape.to_tvec()) else {
+        return false;
+    };
+    let Some(hw) = shape.hw_dims().iter().map(|d| d.to_usize().ok()).collect::<Option<TVec<_>>>()
+    else {
+        return false;
+    };
+    let n = shape.n().and_then(|n| n.to_usize().ok()).unwrap_or(1);
+    n * hw[0] * hw[1] >= 4096
+}
+
+/// Runtime counterpart of `mlx_winograd_eligible`.
+pub fn mlx_winograd_dispatchable(op: &Conv, input: &DeviceTensor, weights: &DeviceTensor) -> bool {
+    let (c, o) = (op.pool_spec.input_channels, op.pool_spec.output_channels);
+    input.datum_type() == DatumType::F32
+        && mlx_conv_dispatchable(op, input, weights)
+        && c.is_multiple_of(32)
+        && o.is_multiple_of(32)
+        && c + o >= 256
+        && weights.shape()[1] == 3
+        && weights.shape()[2] == 3
+        && op.pool_spec.strides().iter().all(|&s| s == 1)
+        && op.pool_spec.dilations().iter().all(|&d| d == 1)
+        && input.shape()[0] * input.shape()[1] * input.shape()[2] >= 4096
+}
+
+/// F(6x6, 3x3) Winograd convolution, mirroring mlx `winograd_conv_2D_gpu`:
+/// transform the weights and the (zero-padded) input into the 8×8 domain, one
+/// batched GEMM over the 64 domain positions, then transform back.
+pub fn dispatch_mlx_winograd_conv_2d(
+    stream: &MetalStream,
+    op: &Conv,
+    input: &DeviceTensor,
+    weights: &DeviceTensor,
+    output: &DeviceTensor,
+) -> TractResult<()> {
+    let dt = input.datum_type();
+    let tname = match dt {
+        DatumType::F32 => "float32",
+        DatumType::F16 => "float16",
+        _ => bail!("MLX winograd conv: F32/F16 only, got {dt:?}"),
+    };
+    let in_shape = op.pool_spec.data_format.shape(input.shape())?;
+    let out_shape = op.pool_spec.data_format.shape(output.shape())?;
+    let n = *in_shape.n().unwrap_or(&1);
+    let c = *in_shape.c();
+    let o = *out_shape.c();
+    let i_s = [in_shape.hw_dims()[0], in_shape.hw_dims()[1]];
+    let o_s = [out_shape.hw_dims()[0], out_shape.hw_dims()[1]];
+    let padding = op.pool_spec.computed_padding(in_shape.hw_dims());
+    let pad = [padding[0].pad_before, padding[1].pad_before];
+
+    // The transforms consume 8×8 tiles with 6×6 of output each, so the input is
+    // materialized zero-padded and tile-aligned.
+    let padded_h = 6 * (i_s[0] + 2 * pad[0] - 2).div_ceil(6) + 2;
+    let padded_w = 6 * (i_s[1] + 2 * pad[1] - 2).div_ceil(6) + 2;
+    let in_padded = stream.transient_zeroed(dt, &[n, padded_h, padded_w, c])?;
+    let padded_strides = Tensor::natural_strides(&[n, padded_h, padded_w, c]);
+    let data_offset = pad[0] * padded_strides[1] as usize + pad[1] * padded_strides[2] as usize;
+    stream.copy_nd_into(
+        input,
+        &in_padded,
+        data_offset * dt.size_of(),
+        &[n, i_s[0], i_s[1], c],
+        &padded_strides,
+    )?;
+
+    let n_tiles_h = o_s[0].div_ceil(6);
+    let n_tiles_w = o_s[1].div_ceil(6);
+    let n_tiles = n * n_tiles_h * n_tiles_w;
+
+    let filt_wg = unsafe { DeviceTensor::uninitialized_dt(dt, &[64, c, o])? };
+    let inp_wg = unsafe { DeviceTensor::uninitialized_dt(dt, &[64, n_tiles, c])? };
+    let out_wg = unsafe { DeviceTensor::uninitialized_dt(dt, &[64, n_tiles, o])? };
+    for t in [&in_padded, &filt_wg, &inp_wg, &out_wg] {
+        stream.retain_tensor(t);
+    }
+    stream.retain_tensor(input);
+    stream.retain_tensor(weights);
+    stream.retain_tensor(output);
+
+    // weight transform
+    let pipeline = stream.load_pipeline(
+        LibraryName::MlxConvDw,
+        &format!("winograd_conv_2d_weight_transform_{tname}_bc32"),
+    )?;
+    let command_buffer = stream.command_buffer();
+    command_buffer.encode(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_metal_tensor(0, weights, metal::MTLResourceUsage::Read);
+        encoder.set_metal_tensor(1, &filt_wg, metal::MTLResourceUsage::Write);
+        encoder.set_slice(2, &[c as i32]);
+        encoder.set_slice(3, &[o as i32]);
+        encoder.dispatch_thread_groups(
+            MTLSize { width: (o / 4) as _, height: 1, depth: 1 },
+            MTLSize { width: 32, height: 4, depth: 1 },
+        );
+    });
+
+    // input transform
+    let to4 = |s: &[isize]| -> [i64; 4] { [s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64] };
+    let padded_params = MlxConvParams2D {
+        n: n as i32,
+        c: c as i32,
+        o: o as i32,
+        i_s: [padded_h as i32, padded_w as i32],
+        w_s: [3, 3],
+        o_s: [o_s[0] as i32, o_s[1] as i32],
+        str: [1, 1],
+        pad: [0, 0],
+        kdil: [1, 1],
+        idil: [1, 1],
+        in_strides: to4(&padded_strides),
+        wt_strides: to4(weights.strides()),
+        out_strides: to4(output.strides()),
+        groups: 1,
+        flip: false,
+    };
+    let pipeline = stream.load_pipeline(
+        LibraryName::MlxConvDw,
+        &format!("winograd_conv_2d_input_transform_{tname}_bc32"),
+    )?;
+    let command_buffer = stream.command_buffer();
+    command_buffer.encode(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_metal_tensor(0, &in_padded, metal::MTLResourceUsage::Read);
+        encoder.set_metal_tensor(1, &inp_wg, metal::MTLResourceUsage::Write);
+        encoder.set_slice(2, std::slice::from_ref(&padded_params));
+        encoder.dispatch_thread_groups(
+            MTLSize { width: n_tiles_w as _, height: n_tiles_h as _, depth: n as _ },
+            MTLSize { width: 32, height: 2, depth: 2 },
+        );
+    });
+
+    // batched gemm over the 64 domain positions
+    crate::kernels::matmul::mlx_gemm_dispatch_batched(
+        stream, dt, 64, n_tiles, o, c, &inp_wg, &filt_wg, &out_wg,
+    )?;
+
+    // output transform
+    let pipeline = stream.load_pipeline(
+        LibraryName::MlxConvDw,
+        &format!("winograd_conv_2d_output_transform_{tname}_bo32"),
+    )?;
+    let command_buffer = stream.command_buffer();
+    command_buffer.encode(|encoder| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_metal_tensor(0, &out_wg, metal::MTLResourceUsage::Read);
+        encoder.set_metal_tensor(1, output, metal::MTLResourceUsage::Write);
+        encoder.set_slice(2, std::slice::from_ref(&padded_params));
+        encoder.dispatch_thread_groups(
+            MTLSize { width: n_tiles_w as _, height: n_tiles_h as _, depth: n as _ },
+            MTLSize { width: 32, height: 2, depth: 2 },
+        );
+    });
+    Ok(())
+}

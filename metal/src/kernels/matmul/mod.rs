@@ -1,7 +1,7 @@
 mod basic;
 mod ggml_gemm;
 pub mod mfa;
-mod mlx_gemm;
+pub mod mlx_gemm;
 
 pub use basic::BasicMatMul;
 pub use ggml_gemm::GgmlGemm;
@@ -198,6 +198,40 @@ impl GemmDispatchParams {
             }
         }
     }
+}
+
+/// Batched `c[b] = a[b] @ b[b]`, both operands row-major, for callers that
+/// already hold device tensors (the Winograd conv domain GEMM).
+#[allow(clippy::too_many_arguments)]
+pub fn mlx_gemm_dispatch_batched(
+    stream: &MetalStream,
+    dt: DatumType,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &DeviceTensor,
+    b: &DeviceTensor,
+    c: &DeviceTensor,
+) -> TractResult<()> {
+    let a_strides = natural_strides(&[batch, m, k]);
+    let b_strides = natural_strides(&[batch, k, n]);
+    mlx_gemm::dispatch_metal_mlx_gemm(
+        stream,
+        dt,
+        (batch, m, n, k),
+        unsafe { std::mem::transmute::<&[isize], &[usize]>(a_strides.as_slice()) },
+        a.buffer_offset(),
+        &get_metal_buffer(a),
+        false,
+        unsafe { std::mem::transmute::<&[isize], &[usize]>(b_strides.as_slice()) },
+        b.buffer_offset(),
+        &get_metal_buffer(b),
+        false,
+        &get_metal_buffer(c),
+        c.buffer_offset(),
+        false,
+    )
 }
 
 pub trait GemmKernel:

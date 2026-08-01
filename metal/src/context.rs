@@ -6,7 +6,7 @@ use crate::tensor::{MValue, MetalTensor};
 use metal::NSUInteger;
 use tract_core::tract_linalg::block_quant::{BlockQuantFact, BlockQuantStorage};
 use tract_gpu::device::{DeviceBuffer, DeviceContext};
-use tract_gpu::tensor::{DeviceTensor, OwnedDeviceTensor};
+use tract_gpu::tensor::{DeviceTensor, IntoDevice, OwnedDeviceTensor};
 use tract_gpu::utils::as_q40_tensor;
 
 use std::alloc::Layout;
@@ -328,6 +328,32 @@ impl MetalStream {
         constants: Option<ConstantValues>,
     ) -> TractResult<ComputePipelineState> {
         self.context.load_pipeline_with_constants(library_name, func_name, constants)
+    }
+
+    /// Zero-filled scratch tensor.
+    pub fn transient_zeroed(&self, dt: DatumType, shape: &[usize]) -> TractResult<DeviceTensor> {
+        Tensor::zero_dt(dt, shape)?.into_device()
+    }
+
+    /// Copy `input` into `output` at `output_offset` bytes, keeping the given
+    /// logical shape and output strides.
+    pub fn copy_nd_into(
+        &self,
+        input: &DeviceTensor,
+        output: &DeviceTensor,
+        output_offset: usize,
+        shape: &[usize],
+        output_strides: &[isize],
+    ) -> TractResult<()> {
+        crate::kernels::array::metal_copy_nd_dispatch(
+            input,
+            0,
+            input.strides(),
+            output,
+            output_offset,
+            shape,
+            output_strides,
+        )
     }
 
     pub fn retain_tensor(&self, tensor: &DeviceTensor) {

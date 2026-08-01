@@ -768,4 +768,157 @@ mod mlx_conv_tests {
         }
         Ok(())
     }
+
+    fn check_winograd(
+        dt: DatumType,
+        n: usize,
+        ih: usize,
+        iw: usize,
+        c: usize,
+        o: usize,
+        padding: PaddingSpec,
+    ) -> TractResult<()> {
+        let pool_spec = PoolSpec::new(
+            DataFormat::NHWC,
+            tvec![3, 3],
+            padding,
+            Some(tvec![1, 1]),
+            Some(tvec![1, 1]),
+            c,
+            o,
+        );
+        let op = Conv { pool_spec, kernel_fmt: KernelFormat::OHWI, group: 1, q_params: None };
+        let input = ramp(dt, &[n, ih, iw, c], 1)?;
+        let weights = ramp(dt, &[o, 3, 3, c], 2)?;
+        let bias = Tensor::zero_dt(dt, &[o])?;
+        let expected = op
+            .eval(tvec![
+                input.clone().into_tvalue(),
+                weights.clone().into_tvalue(),
+                bias.into_tvalue()
+            ])?
+            .remove(0)
+            .into_tensor();
+        let got = with_borrowed_metal_stream(|stream| {
+            let i = input.clone().into_device()?;
+            let w = weights.clone().into_device()?;
+            let out = unsafe { DeviceTensor::uninitialized_dt(dt, expected.shape())? };
+            super::mlx_conv::dispatch_mlx_winograd_conv_2d(stream, &op, &i, &w, &out)?;
+            stream.wait_until_completed()?;
+            Ok(out.to_host()?.into_tensor())
+        })?;
+        let e = expected.cast_to::<f32>()?.into_owned();
+        let g = got.cast_to::<f32>()?.into_owned();
+        let (ev, gv) = unsafe { (e.as_slice_unchecked::<f32>(), g.as_slice_unchecked::<f32>()) };
+        let max_abs = ev.iter().zip(gv).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let scale = ev.iter().map(|x| x.abs()).fold(0f32, f32::max);
+        println!(
+            "  winograd {dt:?} {n}x{ih}x{iw}x{c}->{o}: max_abs={max_abs:.5} rel={:.2e}",
+            max_abs / scale.max(1e-6)
+        );
+        expected
+            .close_enough(&got, Approximation::SuperApproximate)
+            .with_context(|| format!("winograd dt={dt:?} {n}x{ih}x{iw}x{c}->{o}"))
+    }
+
+    #[test]
+    fn winograd_3x3_same() -> TractResult<()> {
+        check_winograd(DatumType::F32, 1, 64, 64, 32, 224, PaddingSpec::SameUpper)
+    }
+
+    #[test]
+    fn winograd_3x3_valid() -> TractResult<()> {
+        check_winograd(DatumType::F32, 1, 66, 66, 64, 192, PaddingSpec::Valid)
+    }
+
+    // f16 is declined on purpose — see mlx_winograd_eligible.
+    #[test]
+    fn winograd_declines_f16() -> TractResult<()> {
+        let (c, o) = (64usize, 192usize);
+        let pool_spec = PoolSpec::new(
+            DataFormat::NHWC,
+            tvec![3, 3],
+            PaddingSpec::SameUpper,
+            Some(tvec![1, 1]),
+            Some(tvec![1, 1]),
+            c,
+            o,
+        );
+        let op = Conv { pool_spec, kernel_fmt: KernelFormat::OHWI, group: 1, q_params: None };
+        let f16f = DatumType::F16.fact(&[1usize, 64, 64, c]);
+        let wf = DatumType::F16.fact(&[o, 3usize, 3, c]);
+        let bf = DatumType::F16.fact(&[o]);
+        assert!(!super::mlx_conv::mlx_winograd_eligible(&op, &[&f16f, &wf, &bf]));
+        let f32f = DatumType::F32.fact(&[1usize, 64, 64, c]);
+        let wf32 = DatumType::F32.fact(&[o, 3usize, 3, c]);
+        let bf32 = DatumType::F32.fact(&[o]);
+        assert!(super::mlx_conv::mlx_winograd_eligible(&op, &[&f32f, &wf32, &bf32]));
+        Ok(())
+    }
+
+    // Winograd against the implicit-GEMM path on the shapes it accepts.
+    //   cargo test -p tract-metal bench_winograd -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_winograd() -> TractResult<()> {
+        use std::time::Instant;
+        let dt = DatumType::F32;
+        println!("\n  shape (H,W,C -> O, 3x3 s1)      implicit ms  winograd ms   gain");
+        for &(ih, iw, c, o) in &[
+            (147usize, 147usize, 32usize, 64usize),
+            (73, 73, 64, 192),
+            (35, 35, 64, 96),
+            (35, 35, 96, 96),
+            (17, 17, 160, 192),
+            (64, 64, 128, 128),
+            (128, 128, 64, 256),
+        ] {
+            let pool_spec = PoolSpec::new(
+                DataFormat::NHWC,
+                tvec![3, 3],
+                PaddingSpec::SameUpper,
+                Some(tvec![1, 1]),
+                Some(tvec![1, 1]),
+                c,
+                o,
+            );
+            let op = Conv { pool_spec, kernel_fmt: KernelFormat::OHWI, group: 1, q_params: None };
+            let input = ramp(dt, &[1, ih, iw, c], 1)?;
+            let weights = ramp(dt, &[o, 3, 3, c], 2)?;
+            let eligible = {
+                let f = |d: &[usize]| dt.fact(d);
+                let (a, b, bi) = (f(&[1, ih, iw, c]), f(&[o, 3, 3, c]), f(&[o]));
+                super::mlx_conv::mlx_winograd_eligible(&op, &[&a, &b, &bi])
+            };
+            let (g, w) = with_borrowed_metal_stream(|stream| {
+                let i = input.clone().into_device()?;
+                let wt = weights.clone().into_device()?;
+                let out = unsafe { DeviceTensor::uninitialized_dt(dt, &[1, ih, iw, o])? };
+                let time = |f: &dyn Fn() -> TractResult<()>| -> TractResult<f64> {
+                    f()?;
+                    stream.wait_until_completed()?;
+                    let t = Instant::now();
+                    for _ in 0..10 {
+                        f()?;
+                    }
+                    stream.wait_until_completed()?;
+                    Ok(t.elapsed().as_secs_f64() / 10.0)
+                };
+                let g =
+                    time(&|| super::mlx_conv::dispatch_mlx_conv_2d(stream, &op, &i, &wt, &out))?;
+                let w = time(&|| {
+                    super::mlx_conv::dispatch_mlx_winograd_conv_2d(stream, &op, &i, &wt, &out)
+                })?;
+                Ok((g, w))
+            })?;
+            println!(
+                "  {ih}x{iw}x{c} -> {o}{}   {:10.4} {:11.4} {:7.2}x",
+                if eligible { "  " } else { " ✗" },
+                g * 1e3,
+                w * 1e3,
+                g / w
+            );
+        }
+        Ok(())
+    }
 }
