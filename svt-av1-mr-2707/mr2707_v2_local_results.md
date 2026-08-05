@@ -150,3 +150,18 @@ Conclusion: ship v2 and state the Spreadsheet trade. If a no-regression profile
 is ever preferred, E5 is the principled knob (small blocks run palette only when
 the palette is exact, i.e. no k-means quantization) at the cost above — two
 lines in search_palette_luma.
+
+### Content-detection feasibility (negative result)
+
+A per-frame "spreadsheet-like" classifier switching to the E5 profile was
+evaluated at the statistic level on the source clips. Neither whole-frame block
+composition (exactly-palettizable share among non-flat 8×8: Debugging 56.4%,
+Slides1 62.0%, Spreadsheet 60.3%, Wikipedia 75.6%) nor changed-region
+composition (exact share: Wikipedia 39.8% vs Spreadsheet 38.7%; median colors
+12 vs 13) separates the losing clip from the biggest winner. What differs is
+transform-path efficiency on grid-aligned structure, which pixel statistics
+cannot see cheaply — the RD search is already the per-block detector of it.
+Preferred follow-up is therefore content-agnostic: audit palette index-map
+rate estimation (MD estimate vs actual coded bits on Spreadsheet at high QP);
+if palette rate is underestimated on many-transition maps, correcting it fixes
+dense small blocks with no classifier and no cost to the winning clips.
