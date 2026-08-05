@@ -1,0 +1,134 @@
+From f419a48ea18eff1007b0134a5aaf2703051e5e64 Mon Sep 17 00:00:00 2001
+From: Ckristian Zoli <ckristian.zoli@gmail.com>
+Date: Wed, 5 Aug 2026 09:35:56 +0000
+Subject: [PATCH] RTC: palette on inter-frame intra blocks for screen content
+
+Palette only ran on I-slices in the RTC path; the static text/UI of a
+screen-share stream lives in intra blocks inside inter frames. Enable a
+palette level there at M7-M8 for detected screen content, with the frame
+header set coherently at picture decision. The frame-idle gate reads
+norm_me_dist in svt_aom_sig_deriv_mode_decision_config_rtc, post-ME,
+where this frame's value exists (at picture decision it does not, and a
+recycled parent PCS holds the previous picture's value); an idle frame
+drops palette and signals exactly as baseline. A per-block ME-residual
+floor in inject_palette_candidates skips the search where inter
+prediction is already essentially perfect.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ Source/API/EbDebugMacros.h         |  2 ++
+ Source/Lib/Codec/enc_mode_config.c | 30 ++++++++++++++++++++++++++++++
+ Source/Lib/Codec/mode_decision.c   | 28 ++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/Source/API/EbDebugMacros.h b/Source/API/EbDebugMacros.h
+index be99138..8a7bd94 100644
+--- a/Source/API/EbDebugMacros.h
++++ b/Source/API/EbDebugMacros.h
+@@ -34,6 +34,8 @@
+ extern "C" {
+ #endif // __cplusplus
+ 
++#define FTR_RTC_INTER_PALETTE       1 // Palette on RTC inter-frame intra blocks (screen content, M7-M8); libaom-RT force_palette_test parity. Frame-idle gated post-ME (md-config stage) plus a per-block ME-residual floor at candidate injection.
++
+ //FOR DEBUGGING - Do not remove
+ 
+ 
+diff --git a/Source/Lib/Codec/enc_mode_config.c b/Source/Lib/Codec/enc_mode_config.c
+index 13b28eb..96f722e 100644
+--- a/Source/Lib/Codec/enc_mode_config.c
++++ b/Source/Lib/Codec/enc_mode_config.c
+@@ -2251,6 +2251,22 @@ void svt_aom_sig_deriv_multi_processes_rtc(SequenceControlSet* scs, PictureParen
+ 
+     // Set palette level
+     if (sc_class5) {
++#if FTR_RTC_INTER_PALETTE
++        // Palette also on intra blocks inside inter frames at M7-M8, where the static text/UI of a
++        // screen-share stream lives. The level must be set here, pre-ME, so allow_screen_content_tools
++        // below accounts for it; the frame-idle gate needs this frame's norm_me_dist, which only
++        // exists post-ME, so it runs in svt_aom_sig_deriv_mode_decision_config_rtc. Active inter
++        // frames therefore carry allow_screen_content_tools=1 even where most blocks decline
++        // palette: the cost is one header bit plus the per-block palette_y_mode flag on
++        // palette-eligible intra blocks.
++        if (enc_mode <= ENC_M7) {
++            pcs->palette_level = is_islice ? 5 : 7;
++        } else if (enc_mode <= ENC_M8) {
++            pcs->palette_level = 7;
++        } else {
++            pcs->palette_level = 0;
++        }
++#else
+         if (enc_mode <= ENC_M7) {
+             pcs->palette_level = is_islice ? 5 : 0;
+         } else if (enc_mode <= ENC_M8) {
+@@ -2258,6 +2274,7 @@ void svt_aom_sig_deriv_multi_processes_rtc(SequenceControlSet* scs, PictureParen
+         } else {
+             pcs->palette_level = 0;
+         }
++#endif
+     } else {
+         pcs->palette_level = 0;
+     }
+@@ -9566,6 +9583,19 @@ void svt_aom_sig_deriv_mode_decision_config_rtc(SequenceControlSet* scs, Picture
+     const bool               transition_present = (ppcs->transition_present == 1);
+     const uint32_t           sq_qp              = scs->static_config.qp;
+     const bool               use_flat_ipp       = ppcs->hierarchical_levels == 0; // rtc path, so rtc is true
++#if FTR_RTC_INTER_PALETTE
++    // Frame-idle gate for inter-frame palette. norm_me_dist is written post-ME (initial RC), so this
++    // decision cannot be made where palette_level is first set (picture decision, pre-ME). Zero
++    // average ME distortion means a frozen screen: drop palette and re-derive the header flag so an
++    // idle inter frame signals exactly as baseline. Exact zero, not a small threshold: an idle
++    // screen capture repeats pixel-exactly, while a threshold could misclassify frames whose
++    // activity is small or localized (diluted in the frame-wide average) and lose palette there.
++    if (!is_islice && ppcs->palette_level && ppcs->norm_me_dist == 0) {
++        ppcs->palette_level = 0;
++        set_palette_level(ppcs, 0);
++        ppcs->frm_hdr.allow_screen_content_tools = ppcs->frm_hdr.allow_intrabc ? 1 : 0;
++    }
++#endif
+     //MFMV
+     uint8_t mfmv_level = 0;
+     if (is_islice || scs->mfmv_enabled == 0 || pcs->ppcs->frm_hdr.error_resilient_mode) {
+diff --git a/Source/Lib/Codec/mode_decision.c b/Source/Lib/Codec/mode_decision.c
+index 94b295b..453a810 100644
+--- a/Source/Lib/Codec/mode_decision.c
++++ b/Source/Lib/Codec/mode_decision.c
+@@ -3395,7 +3395,35 @@ int svt_av1_allow_palette(int allow_palette, BlockSize bsize) {
+ void search_palette_luma(PictureControlSet* pcs, ModeDecisionContext* ctx, PaletteInfo* palette_cand,
+                          uint8_t* palette_size_array, uint32_t* tot_palette_cands);
+ 
++#if FTR_RTC_INTER_PALETTE
++// Per-pixel ME-residual floor at or below which an inter block is treated as unchanged content and
++// the palette search is skipped: palette cannot beat a ~0-bit zero-MV skip there.
++#define RTC_INTER_PALETTE_RES_FLOOR 4
++#endif
++
+ static void inject_palette_candidates(PictureControlSet* pcs, ModeDecisionContext* ctx, uint32_t* candidate_total_cnt) {
++#if FTR_RTC_INTER_PALETTE
++    // Skip the palette search on inter blocks where inter prediction is essentially perfect; if
++    // neither ME nor PME distortion is available the search still runs. Returning with no candidates
++    // injected also clears eval_intrabc in generate_md_stage_0_cand when intrabc_ctrls.palette_hint
++    // is set - inert on this path (intrabc_level is 0 in RTC, and intra-BC only exists on intra
++    // frames), but relevant if palette_hint ever extends to inter frames.
++    if (pcs->slice_type != I_SLICE) {
++        uint32_t best_me = (uint32_t)~0;
++        if (ctx->md_me_dist != (uint32_t)~0) {
++            best_me = ctx->md_me_dist;
++        }
++        if (ctx->md_pme_dist != (uint32_t)~0 && ctx->md_pme_dist < best_me) {
++            best_me = ctx->md_pme_dist;
++        }
++        if (best_me != (uint32_t)~0) {
++            const uint32_t per_pix = best_me / (ctx->blk_geom->bwidth * ctx->blk_geom->bheight);
++            if (per_pix <= RTC_INTER_PALETTE_RES_FLOOR) {
++                return;
++            }
++        }
++    }
++#endif
+     uint32_t               can_total_cnt      = *candidate_total_cnt;
+     ModeDecisionCandidate* cand_array         = ctx->fast_cand_array;
+     const TxSize           tx_size_uv         = av1_get_max_uv_txsize(ctx->blk_geom->bsize, 1, 1);
+-- 
+2.43.0
+
