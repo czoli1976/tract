@@ -37,7 +37,7 @@ prefer sole authorship on the MR.
 
 ## Remaining before posting
 
-- Decoder conformance (`aomdec`/`dav1d`) — not runnable in the session container.
+- Decoder conformance: DONE in-session — 16/16 CQP points recon-vs-aomdec byte-exact, all CBR/frozen/multi-KF/scm0 streams decode clean (aomdec + dav1d); see results file.
 - Optionally re-run `run_matrix.sh` on a quiet machine for the published table.
 - Post the refreshed numbers with operating points: b2_scc originals, 130 frames,
   preset 8, `--rtc 1 --scm 1 --lp 1 --rc 0 --cqp {23,31,43,55}`;

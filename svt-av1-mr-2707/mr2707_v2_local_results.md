@@ -51,17 +51,56 @@ Per-QP detail:
 | spreadsheet | 43 | 2017.2 | 2234.4 | +10.8% | 39.86 | 40.29 | +0.43 |
 | spreadsheet | 55 | 878.5 | 939.4 | +6.9% | 34.44 | 34.95 | +0.51 |
 
-## CBR spot check (`--rc 2 --tbr {1000,2500}`)
+## CBR (`--rc 2 --tbr {750,1500,2500,4000}`, Y-PSNR)
+
+| clip | BD-rate v2 vs base |
+|---|---|
+| Debugging | **−10.8%** |
+| Wikipedia | **−12.6%** |
+| Slides1 | **−0.8%** |
+| Spreadsheet | **+2.6%** |
+
+Per-point detail:
 
 | clip | tbr | kbps b/v2 | PSNR-Y base | PSNR-Y v2 | dPSNR |
 |---|---|---|---|---|---|
-| slides1 | 1000 | 883/902 | 37.74 | 38.60 | **+0.86** |
-| slides1 | 2500 | 2191/2215 | 45.94 | 45.76 | **−0.18** |
-| wikipedia | 1000 | 859/851 | 35.58 | 37.00 | +1.42 |
+| debugging | 750 | 720/722 | 35.18 | 36.80 | +1.62 |
+| debugging | 1500 | 1276/1212 | 41.61 | 42.17 | +0.56 |
+| debugging | 2500 | 2000/1833 | 47.44 | 47.87 | +0.43 |
+| debugging | 4000 | 2661/2392 | 51.78 | 52.10 | +0.32 |
+| wikipedia | 750 | 690/705 | 33.80 | 35.20 | +1.40 |
+| wikipedia | 1500 | 1111/1094 | 39.06 | 40.53 | +1.47 |
 | wikipedia | 2500 | 1726/1617 | 44.53 | 45.37 | +0.84 |
+| wikipedia | 4000 | 2439/2232 | 47.79 | 48.32 | +0.53 |
+| slides1 | 750 | 714/723 | 36.35 | 37.35 | +1.00 |
+| slides1 | 1500 | 1294/1308 | 41.53 | 41.78 | +0.25 |
+| slides1 | 2500 | 2191/2215 | 45.94 | 45.76 | **−0.18** |
+| slides1 | 4000 | 3460/3496 | 50.10 | 50.02 | −0.08 |
+| spreadsheet | 750 | 684/689 | 27.26 | 27.52 | +0.26 |
+| spreadsheet | 1500 | 1078/1097 | 30.07 | 30.13 | +0.06 |
+| spreadsheet | 2500 | 1755/1829 | 34.81 | 34.75 | −0.06 |
+| spreadsheet | 4000 | 2714/2785 | 39.20 | 39.09 | −0.11 |
 
-The maintainer's "small loss on Slides1 under CBR" reproduces at the 2500 kbps
-point; the 1000 kbps point gains.
+The maintainer's "small loss on Slides1 under CBR" reproduces and localizes:
+CBR losses appear only at the high-rate points of Slides1/Spreadsheet
+(−0.06 to −0.18 dB), where transform coding of residuals is cheap enough that
+palette's fixed overhead (palette entries + index map) loses; the starved-rate
+points gain +1.0 to +1.6 dB everywhere.
+
+## Decoder conformance (reference decoder `aomdec` 3.x, plus dav1d 1.4.1)
+
+All 16 v2 CQP points re-encoded with `--recon`: bitstream md5 unchanged vs the
+matrix run (the recon tap does not perturb output), and SVT's reconstruction is
+**byte-identical to aomdec's decode** in every case. All v2 CBR, frozen-screen,
+multi-keyframe, and `--scm 0` streams also decode cleanly through both aomdec
+and dav1d. Final tally: 16/16 recon-vs-decode byte-exact, 0 decode failures.
+
+## Graphs (`graphs/`)
+
+- `g1_bdrate.png` — BD-rate per clip, CQP + CBR
+- `g2_rd.png` — RD curves, 2×2 small multiples
+- `g3_cost.png` — per-frame bytes (byte-identical static intro marked) + wall-clock
+- `g4_dbgain.png` — ΔY-PSNR at matched QP
 
 ## Encode time (2 reps, q31, wall-clock, noisy shared 4-core box — indicative only)
 
@@ -73,9 +112,11 @@ should be restated per-clip.
 
 ## Caveats vs the official refresh
 
-- QP set {23, 31, 43, 55} chosen locally; MR's original QP list unknown.
-- Spreadsheet +1.1% vs v1's reported +0.4%: consistent with the ≤0.5 pt effect
-  the maintainer measured for removing the top-8-coverage gate, plus QP-set
-  differences, but worth watching in the official numbers.
-- No decoder-conformance run locally (no aomdec/dav1d in this container).
+- Operating points chosen locally and published above in full: CQP {23, 31, 43, 55},
+  CBR {750, 1500, 2500, 4000} kbps, 130 frames (full clips); the MR's original
+  QP/bitrate lists were never published.
+- Spreadsheet +1.1% CQP / +2.6% CBR vs v1's reported +0.4% / +1.1%: consistent
+  with the ≤0.5 pt effect the maintainer measured for removing the
+  top-8-coverage gate plus operating-point differences, but it is the weak spot —
+  state it plainly in the MR.
 - Timing from a shared container; use a quiet machine for the published numbers.
