@@ -120,3 +120,33 @@ should be restated per-clip.
   top-8-coverage gate plus operating-point differences, but it is the weak spot —
   state it plainly in the MR.
 - Timing from a shared container; use a quiet machine for the published numbers.
+
+## Spreadsheet investigation (post-review experiments)
+
+Spreadsheet is the one clip where v2 loses (+1.1% CQP / +2.6% CBR). Four
+variants tested over the full matrix to locate and price the loss:
+
+| variant | Debugging | Wikipedia | Slides1 | Spreadsheet |
+|---|---|---|---|---|
+| v2 (shipping) | −16.2 / −10.8 | −17.1 / −12.6 | −2.0 / −0.8 | +1.1 / +2.6 |
+| E1: residual floor 4→16 | — | — | — | +0.7 / — |
+| E2: no inter palette < 16×16 | −9.0 / −6.4 | −8.1 / −5.7 | −0.8 / −2.6 | −2.6 / −1.5 |
+| E4: <16×16 only if ≤4 colors | −9.5 / −6.8 | −9.4 / −6.7 | −1.8 / −3.3 | −3.0 / −1.2 |
+| E5: <16×16 only if exact palette (≤8 colors) | −10.3 / −7.3 | −10.3 / −7.4 | −2.9 / −3.4 | −2.6 / −1.9 |
+
+(CQP / CBR BD-rate per cell; E3, inter palette level 8, was strictly worse:
+spreadsheet +2.6 CQP.)
+
+Finding: many-color small blocks are simultaneously the largest source of the
+text-clip wins and the entire source of the Spreadsheet loss — the same
+block-local signature, differing only in surrounding content density. Every
+small-block gate that fixes Spreadsheet (E2/E4/E5) surrenders ~40–45% of the
+Debugging/Wikipedia gains; the exchange rate is ~6–7 points paid per ~4 gained.
+All variants keep frozen-screen output byte-identical to baseline, and the
+clean-v2 rebuild was canary-verified against the published matrix after each
+experiment.
+
+Conclusion: ship v2 and state the Spreadsheet trade. If a no-regression profile
+is ever preferred, E5 is the principled knob (small blocks run palette only when
+the palette is exact, i.e. no k-means quantization) at the cost above — two
+lines in search_palette_luma.
