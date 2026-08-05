@@ -41,4 +41,4 @@ prefer sole authorship on the MR.
 - Optionally re-run `run_matrix.sh` on a quiet machine for the published table.
 - Post the refreshed numbers with operating points: b2_scc originals, 130 frames,
   preset 8, `--rtc 1 --scm 1 --lp 1 --rc 0 --cqp {23,31,43,55}`;
-  CBR `--rc 2 --tbr {1000,2500}`.
+  CBR `--rc 2 --tbr {750,1500,2500,4000}`.
