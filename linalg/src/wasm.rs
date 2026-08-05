@@ -74,6 +74,9 @@ pub fn plug(ops: &mut Ops) {
     {
         ops.sigmoid_f32 = Box::new(|| WasmSigmoid4Relaxed::ew());
         ops.tanh_f32 = Box::new(|| WasmTanh4Relaxed::ew());
+        ops.silu_f32 = Box::new(|| WasmSilu4Relaxed::ew());
+        ops.gelu_f32 = Box::new(|| WasmGelu4Relaxed::ew());
+        ops.erf_f32 = Box::new(|| WasmErf4Relaxed::ew());
     }
 }
 
