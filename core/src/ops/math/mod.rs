@@ -481,33 +481,47 @@ fn declutter_div(
 }
 
 fn declutter_pow(
-    _op: &Pow,
+    op: &Pow,
     model: &TypedModel,
     node: &TypedNode,
 ) -> TractResult<Option<TypedModelPatch>> {
     let b = model.outlet_fact(node.inputs[1])?;
     if let Some(b) = &b.uniform {
         let b = b.cast_to_scalar::<f32>()?;
-        let dt = model.outlet_fact(node.inputs[0])?.datum_type;
-        let unary: Option<Box<dyn TypedOp>> = if b == 2.0 {
-            Some(Box::new(square()))
-        } else if b == 0.5 {
-            Some(Box::new(sqrt()))
-        } else if matches!(dt, DatumType::F16 | DatumType::F32) {
-            Some(Box::new(pow_const(b)))
-        } else {
-            None
-        };
-        if let Some(unary) = unary {
+        if b == 2.0 {
             return Ok(Some(TypedModelPatch::replace_single_op(
                 model,
                 node,
                 &[node.inputs[0]],
-                unary,
+                square(),
+            )?));
+        } else if b == 0.5 {
+            return Ok(Some(TypedModelPatch::replace_single_op(
+                model,
+                node,
+                &[node.inputs[0]],
+                sqrt(),
             )?));
         }
     }
-    crate::ops::nn::gelu_approximate::detect_gelu_approx(_op, model, node)
+    // The gelu-tanh approximation carries its own cube, so let that matcher
+    // claim the node before a uniform exponent collapses it to PowConst.
+    if let Some(patch) = crate::ops::nn::gelu_approximate::detect_gelu_approx(op, model, node)? {
+        return Ok(Some(patch));
+    }
+    if let Some(b) = &model.outlet_fact(node.inputs[1])?.uniform {
+        let b = b.cast_to_scalar::<f32>()?;
+        let dt = model.outlet_fact(node.inputs[0])?.datum_type;
+        if matches!(dt, DatumType::F16 | DatumType::F32) {
+            return Ok(Some(TypedModelPatch::replace_single_op(
+                model,
+                node,
+                &[node.inputs[0]],
+                pow_const(b),
+            )?));
+        }
+    }
+    Ok(None)
 }
 
 element_wise!(abs, Abs, [i8, i16, i32, i64, f16, f32, f64] => |_, xs| {
