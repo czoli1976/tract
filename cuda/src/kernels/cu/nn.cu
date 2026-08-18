@@ -246,6 +246,22 @@ extern "C" __global__ void leaky_relu_f16(const __half *input, __half *output,
     }
 }
 
+extern "C" __global__ void pow_const_f32(const float *input, float *output,
+                                        int32_t len, float exponent) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < len) {
+    output[i] = powf(input[i], exponent);
+  }
+}
+
+extern "C" __global__ void pow_const_f16(const __half *input, __half *output,
+                                         int32_t len, float exponent) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < len) {
+    output[i] = (__half)powf((float)input[i], exponent);
+  }
+}
+
 static __device__ __forceinline__ int
 indices_to_idx_2(int x, int y, int x_strides, int y_strides) {
     return x * x_strides + y * y_strides;

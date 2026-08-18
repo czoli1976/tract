@@ -315,6 +315,21 @@ typedef decltype(leaky_relu<float>) leaky_relu_t;
 template [[host_name("nn_ops::leaky_relu_f32")]] [[kernel]] leaky_relu_t leaky_relu<float>;
 template [[host_name("nn_ops::leaky_relu_f16")]] [[kernel]] leaky_relu_t leaky_relu<half>;
 
+template <typename T>
+[[kernel]] void pow_const(device const void *input_b [[buffer(0)]],
+                          device void *output_b [[buffer(1)]],
+                          constant float &exponent [[buffer(2)]],
+                          uint tpig [[thread_position_in_grid]]) {
+    device const T *input = (device const T *)input_b;
+    device T *output = (device T *)output_b;
+    output[tpig] = T(pow(float(input[tpig]), exponent));
+}
+
+typedef decltype(pow_const<float>) pow_const_t;
+
+template [[host_name("nn_ops::pow_const_f32")]] [[kernel]] pow_const_t pow_const<float>;
+template [[host_name("nn_ops::pow_const_f16")]] [[kernel]] pow_const_t pow_const<half>;
+
 template <typename F>
 [[kernel]] void softmax_nd3(device const void *input_b, device void *output_b,
                             constant const size_t shape[3],

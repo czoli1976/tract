@@ -1,6 +1,7 @@
 mod apply_rope;
 mod gelu_approximate;
 mod leaky_relu;
+mod pow_const;
 mod reduce;
 mod rms_norm;
 mod scaled_masked_softmax;
@@ -11,6 +12,8 @@ pub use gelu_approximate::GeluApproximate;
 pub use gelu_approximate::cuda_gelu_approximate_dispatch;
 pub use leaky_relu::LeakyRelu;
 pub use leaky_relu::cuda_leaky_relu_dispatch;
+pub use pow_const::PowConst;
+pub use pow_const::cuda_pow_const_dispatch;
 pub use reduce::{Reducer, cuda_reduce_launch};
 pub use rms_norm::RmsNorm;
 pub use rms_norm::cuda_rms_norm_dispatch;
