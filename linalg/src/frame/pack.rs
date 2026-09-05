@@ -646,6 +646,20 @@ where
     }
 }
 
+/// Destination bytes to keep live across the `k` passes of [`pack_mn_major`].
+/// One pass over a pane block touches `panes * panel_len` bytes of output and
+/// revisits them on the next `k`, so the block wants to stay in L2; the source
+/// side becomes `k_range.len()` concurrent streams, which is why this is not
+/// simply as large as possible.
+const MN_MAJOR_DEST_BLOCK: usize = 128 * 1024;
+
+/// Resolved once: `pack_mn_major` runs per matmul, and the knob's environment
+/// lookup would otherwise be on that path.
+fn block_dest() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| crate::knobs::TRACT_PACK_BLOCK_DEST.get())
+}
+
 #[inline(never)]
 unsafe fn pack_mn_major<Chunk: Copy>(
     b: *const u8,
@@ -659,17 +673,42 @@ unsafe fn pack_mn_major<Chunk: Copy>(
         let mnr = std::mem::size_of::<Chunk>();
         let full_panes = mn_range_bytes.len() / mnr;
         let partial_pane = mn_range_bytes.len() % mnr;
-        for k in 0..k_range.len() {
-            let mut p_row = packed.add(k * mnr);
-            let mut b_row = b.offset(
-                (k_range.start + k) as isize * k_stride_bytes + mn_range_bytes.start as isize,
-            );
-            for _ in 0..full_panes {
-                p_row.copy_from_nonoverlapping(b_row, mnr);
-                p_row = p_row.add(panel_len);
-                b_row = b_row.add(mnr);
+        // `k` outer would stride the destination by `panel_len` across the whole
+        // packed buffer and then walk it again for every `k`: for a 1x1
+        // convolution's activation that is tens of MB re-traversed `k` times, so
+        // every store misses. Block the panes so the destination each `k` pass
+        // revisits stays cache-resident. Byte-for-byte the same packing.
+        let panes_per_block = if block_dest() {
+            (MN_MAJOR_DEST_BLOCK / panel_len.max(1)).max(1)
+        } else {
+            full_panes.max(1)
+        };
+        let mut pane = 0;
+        while pane < full_panes {
+            let panes = panes_per_block.min(full_panes - pane);
+            for k in 0..k_range.len() {
+                let mut p_row = packed.add(k * mnr + pane * panel_len);
+                let mut b_row = b.offset(
+                    (k_range.start + k) as isize * k_stride_bytes
+                        + mn_range_bytes.start as isize
+                        + (pane * mnr) as isize,
+                );
+                for _ in 0..panes {
+                    p_row.copy_from_nonoverlapping(b_row, mnr);
+                    p_row = p_row.add(panel_len);
+                    b_row = b_row.add(mnr);
+                }
             }
-            if partial_pane > 0 {
+            pane += panes;
+        }
+        if partial_pane > 0 {
+            for k in 0..k_range.len() {
+                let p_row = packed.add(k * mnr + full_panes * panel_len);
+                let b_row = b.offset(
+                    (k_range.start + k) as isize * k_stride_bytes
+                        + mn_range_bytes.start as isize
+                        + (full_panes * mnr) as isize,
+                );
                 p_row.copy_from_nonoverlapping(b_row, partial_pane);
             }
         }

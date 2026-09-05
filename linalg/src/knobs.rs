@@ -66,3 +66,10 @@ tract_data::declare_knob!(
     None,
     "Edit the detected instruction-set features, comma-separated with +/- (e.g. '-sve2,+fp16'). Applies to every architecture; a removed feature takes its kernels out of the pool and the dispatch policies that would have named them."
 );
+
+tract_data::declare_knob!(
+    TRACT_PACK_BLOCK_DEST,
+    bool,
+    false,
+    "Block pack_mn_major's destination so the bytes one k pass revisits stay cache-resident."
+);
