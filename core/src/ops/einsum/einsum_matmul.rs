@@ -8,6 +8,7 @@ use super::*;
 use crate::ops::cast::cast;
 use crate::ops::math::add;
 use crate::ops::matmul::ModePicker;
+use crate::ops::matmul::lazy_pack::LazyMatMulPack;
 use crate::ops::matmul::optimized::{
     AddMatMulGeometry, MapOutputAxisToInput, MatMulOperand, OptMatMul, ProtoFusedSpec,
 };
@@ -16,6 +17,7 @@ use crate::ops::matmul::quant::{
     combine_scales, compensate_zero_points, requant, wire_ensure_q8_flavour,
 };
 use crate::ops::nn::{Reduce, Reducer};
+use tract_linalg::pack::PackedFormat;
 
 pub fn merge_consecutive_same_role_axes(model: &mut TypedModel) -> TractResult<()> {
     Rewriter::default()
@@ -936,19 +938,38 @@ fn optimized_mat_mul(
             })
         }
     } else {
-        Box::new(OptMatMulPack {
-            packers: impls
-                .iter()
-                .map(|(mmm, p, pe)| {
-                    pe.as_ref()
-                        .map(|pe| pe.from.clone())
-                        .unwrap_or_else(|| mmm.packings()[*p].0.clone())
-                })
-                .collect(),
-            mode_picker: mode_picker.clone(),
-            k_axis: op.a_k(),
-            mn_axis: op.a_m(),
-        })
+        let packers: Vec<Box<dyn tract_linalg::mmm::MMMInputFormat>> = impls
+            .iter()
+            .map(|(mmm, p, pe)| {
+                pe.as_ref()
+                    .map(|pe| pe.from.clone())
+                    .unwrap_or_else(|| mmm.packings()[*p].0.clone())
+            })
+            .collect();
+        // A is an activation here, so this pack is paid every run and the matmul
+        // reads it straight back. Where there is one packing, no extractor, and
+        // a single packed value, the panels can be gathered on demand instead --
+        // see `lazy_pack`. Anything else keeps the materialised pack.
+        let lazy = TRACT_LAZY_MATMUL_PACK.get()
+            && matches!(mode_picker, ModePicker::Single)
+            && packers.len() == 1
+            && impls.iter().all(|(_, _, pe)| pe.is_none())
+            && packers[0].downcast_ref::<PackedFormat>().is_some_and(|pf| {
+                let lazy =
+                    LazyMatMulPack { packer: pf.clone(), k_axis: op.a_k(), mn_axis: op.a_m() };
+                lazy.output_shape(&input_shapes[0]).iter().all(|d| d.is_one())
+            });
+        if lazy {
+            let pf = packers[0].downcast_ref::<PackedFormat>().unwrap().clone();
+            Box::new(LazyMatMulPack { packer: pf, k_axis: op.a_k(), mn_axis: op.a_m() })
+        } else {
+            Box::new(OptMatMulPack {
+                packers,
+                mode_picker: mode_picker.clone(),
+                k_axis: op.a_k(),
+                mn_axis: op.a_m(),
+            })
+        }
     };
     let pa = patch.wire_node(format!("{prefix}.pack_a"), pack_a, &[taps[0]])?[0];
 
@@ -1019,3 +1040,10 @@ fn optimized_mat_mul(
     patch.shunt_outside(model, node.id.into(), output)?;
     Ok(Some(patch))
 }
+
+crate::declare_knob!(
+    TRACT_LAZY_MATMUL_PACK,
+    bool,
+    false,
+    "Gather an activation's panels inside the matmul instead of packing it into a tensor first."
+);

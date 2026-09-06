@@ -1,4 +1,5 @@
 pub mod de_block_quant;
+pub mod lazy_pack;
 pub mod optimized;
 pub mod pack;
 pub mod quant;
