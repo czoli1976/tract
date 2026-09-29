@@ -16,6 +16,7 @@ mod fuse;
 
 mod act;
 mod act_f32;
+mod depthwise;
 #[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
 mod dispatch_tests;
 mod exp;
@@ -27,6 +28,7 @@ mod reduce;
 
 pub use act::*;
 pub use act_f32::*;
+pub use depthwise::*;
 pub use exp::*;
 pub use ln::*;
 pub use mmm_f32_gemm::*;
