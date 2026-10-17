@@ -1,0 +1,50 @@
+version 1.0;
+
+extension tract_registry tract_core;
+
+fragment scan_body_0(
+    x_source: tensor<scalar>,
+    W: tensor<scalar>,
+    R: tensor<scalar>,
+    b: tensor<scalar>,
+    h_source: tensor<scalar>,
+    c_source: tensor<scalar>
+) -> (Y_Ht_fixed: tensor<scalar>, Y_Ct_fixed: tensor<scalar>)
+{
+  Xt = squeeze(x_source, axes = [1]);
+  Y_Xt_WT = tract_core_einsum([Xt, W], expr = "mk,nk->mn", acc = "f32", output = "");
+  Ht_1 = squeeze(h_source, axes = [1]);
+  Y_Ht_1_RT = tract_core_einsum([Ht_1, R], expr = "mk,nk->mn", acc = "f32", output = "");
+  Y_preact0 = add(Y_Xt_WT, Y_Ht_1_RT);
+  Y_Wb_all = slice(b, axes = [1], begin = [0], end = [64]);
+  Y_Rb_all = slice(b, axes = [1], begin = [64], end = [128]);
+  Y_bias_all = add(Y_Wb_all, Y_Rb_all);
+  Y_preact = add(Y_preact0, Y_bias_all);
+  Ct_1 = squeeze(c_source, axes = [1]);
+  ( Y_lstm_cell, Y_lstm_cell_1 ) = tract_core_lstm_epilogue(Y_preact, Ct_1, hidden = 16);
+  Y_Ht_fixed = unsqueeze(Y_lstm_cell, axes = [1]);
+  Y_Ct_fixed = unsqueeze(Y_lstm_cell_1, axes = [1]);
+}
+
+fragment tract_core_properties(
+) -> (properties: (string, tensor<scalar>)[])
+{
+  properties = [("tract_nnef_ser_version", "0.23.2-pre"), ("tract_nnef_format_version", "beta1")];
+}
+
+graph network(X) -> (Y, Y_h, Y_c) {
+  X = external(shape = [3, 8, 5]);
+  Y_x_batch_first = transpose(X, axes = [1, 0, 2]);
+  Y_w = variable<scalar>(label = "Y.w", shape = [64, 5]);
+  Y_r = variable<scalar>(label = "Y.r", shape = [64, 16]);
+  Y_b_dir = variable<scalar>(label = "Y.b_dir", shape = [1, 128]);
+  Y_h0 = variable<scalar>(label = "Y.h0", shape = [8, 1, 16]);
+  ( Y, Y_1, Y_2 ) = tract_core_scan(body = "scan_body_0", scan = [("x_source", Y_x_batch_first, 1, 1)], full = [("W", Y_w), ("R", Y_r), ("b", Y_b_dir)], state = [("h_source", Y_h0, "Y.Ht_fixed"), ("c_source", Y_h0, "Y.Ct_fixed")], output = [("Y.Ht_fixed", "full", 1, 1), ("Y.Ht_fixed", "last", 0, 1), ("Y.Ct_fixed", "last", 0, 1)], skip = 0, reset_every_turn = false, external_state = false);
+  Y_y_batch_middle = transpose(Y, axes = [1, 0, 2]);
+  Y_y = unsqueeze(Y_y_batch_middle, axes = [1]);
+  Y_y_h_batch_middle = transpose(Y_1, axes = [1, 0, 2]);
+  Y_y_c_batch_middle = transpose(Y_2, axes = [1, 0, 2]);
+  Y = Y_y;
+  Y_h = Y_y_h_batch_middle;
+  Y_c = Y_y_c_batch_middle;
+}

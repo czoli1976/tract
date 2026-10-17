@@ -94,7 +94,7 @@ pub fn change_axes(
         return Ok(None);
     }
     debug!("  Considering change {change:?}");
-    let mut todo_changes = vec![(change.clone(), None)];
+    let mut todo_changes = vec![change.clone()];
     let mut changed_wires: HashMap<TVec<OutletId>, AxisOp> = HashMap::new();
     let bound_outlets = |o: OutletId| -> TVec<OutletId> {
         bounds.iter().find(|b| b.contains(&o)).cloned().unwrap_or_else(|| tvec!(o))
@@ -102,7 +102,10 @@ pub fn change_axes(
     changed_wires.insert(bound_outlets(change.outlet), change.op.clone());
     let mut changed_ops: HashMap<usize, Box<dyn TypedOp>> = HashMap::new();
     let mut rewired_scalar_input: HashMap<InletId, (OutletId, AxisOp)> = Default::default();
-    while let Some((change, emitter)) = todo_changes.pop() {
+    // A node consuming one outlet on several inlets must still see the change on each inlet
+    // it did not itself account for, so track handled interfaces rather than emitter nodes.
+    let mut handled_interfaces: HashSet<(usize, InOut)> = HashSet::new();
+    while let Some(change) = todo_changes.pop() {
         rule_if!(explored.insert(change.clone()));
         let outlet_group = bound_outlets(change.outlet);
         for &outlet in &outlet_group {
@@ -115,7 +118,7 @@ pub fn change_axes(
                 interfaces.push((inlet.node, InOut::In(inlet.slot)));
             }
             for (node_id, io) in interfaces {
-                if Some(node_id) == emitter {
+                if !handled_interfaces.insert((node_id, io)) {
                     continue;
                 }
                 let node = model.node(node_id);
@@ -147,6 +150,7 @@ pub fn change_axes(
                     changed_ops.insert(node.id, op);
                 }
                 for (wire, op) in wire_changes.into_iter() {
+                    handled_interfaces.insert((node_id, wire));
                     let outlet = wire.as_outlet(node);
                     // stop upstram propagation to a scalar constant: we will clone it and alter it
                     // at patch generation time
@@ -164,8 +168,7 @@ pub fn change_axes(
                         Entry::Vacant(entry) => {
                             trace!("         {wire:?} {op:?} change on {outlet_group:?} is new");
                             entry.insert(op.clone());
-                            todo_changes
-                                .push((AxisChange { outlet: outlet_group[0], op }, Some(node_id)));
+                            todo_changes.push(AxisChange { outlet: outlet_group[0], op });
                         }
                         Entry::Occupied(previous) => {
                             if *previous.get() == op {
