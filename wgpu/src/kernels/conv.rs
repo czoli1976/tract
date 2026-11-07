@@ -210,6 +210,7 @@ pub fn wgpu_conv_dispatch_with_precision(
             [padding[0].pad_before, padding[1].pad_before],
             [n, co, ih, iw, oh, ow],
             in_strides,
+            q.context().apple_hardware_webgpu(),
         );
         let pixels = n * oh * ow;
         let tiled = direct.is_none() && tiled_applies(groups, co_pg, pixels, ci_pg * kh * kw);
@@ -1147,6 +1148,7 @@ fn direct_tiling(
     pad_before: [usize; 2],
     [n, co, ih, iw, oh, ow]: [usize; 6],
     in_strides: [usize; 4],
+    apple_hardware_webgpu: bool,
 ) -> Option<DirectTile> {
     let spec = &op.pool_spec;
     if !matches!(dt, ShaderDtype::F32 | ShaderDtype::F16)
@@ -1166,9 +1168,53 @@ fn direct_tiling(
     {
         return None;
     }
-    let tile = DirectTile::for_types(dt, dt == ShaderDtype::F16 && accumulate_f32, co);
+    let tile = if apple_hardware_webgpu
+        && dt == ShaderDtype::F16
+        && !accumulate_f32
+        && n == 1
+        && measured_four_row_shape(spec.input_channels, co, ih, iw)
+    {
+        DirectTile { co: 4, rows: 4 }
+    } else {
+        DirectTile::for_types(dt, dt == ShaderDtype::F16 && accumulate_f32, co)
+    };
     (tile.threads(n, oh, ow).div_ceil(CONV_DIRECT_WG as usize) <= GRID_LIMIT as usize)
         .then_some(tile)
+}
+
+fn measured_four_row_shape(ci: usize, co: usize, h: usize, w: usize) -> bool {
+    matches!(
+        (ci, co, h, w),
+        (80, 80, 45, 80)
+            | (171, 80, 45, 80)
+            | (99, 64, 56, 96)
+            | (99, 64, 64, 112)
+            | (40, 40, 68, 120)
+            | (107, 40, 68, 120)
+            | (99, 64, 72, 128)
+            | (40, 20, 90, 160)
+            | (40, 40, 90, 160)
+            | (107, 40, 90, 160)
+            | (32, 32, 112, 192)
+            | (64, 32, 112, 192)
+            | (64, 64, 112, 192)
+            | (32, 32, 128, 224)
+            | (64, 32, 128, 224)
+            | (64, 64, 128, 224)
+            | (59, 32, 135, 240)
+            | (32, 32, 144, 256)
+            | (64, 32, 144, 256)
+            | (64, 64, 144, 256)
+            | (32, 32, 180, 320)
+            | (59, 32, 180, 320)
+            | (35, 16, 224, 384)
+            | (35, 16, 256, 448)
+            | (16, 16, 270, 480)
+            | (35, 16, 270, 480)
+            | (35, 16, 288, 512)
+            | (16, 16, 360, 640)
+            | (35, 16, 360, 640)
+    )
 }
 
 /// Register-blocked direct 3x3 convolution: each thread owns `DIRECT_PX`
