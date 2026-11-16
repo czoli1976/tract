@@ -124,6 +124,7 @@ impl Runtime for WgpuRuntime {
         mut model: TypedModel,
         options: &RunOptions,
     ) -> TractResult<Box<dyn Runnable>> {
+        model = model.into_decluttered()?;
         WgpuTransform.transform(&mut model)?;
         model = model.into_optimized()?;
         if hybrid_fallback_available() {
